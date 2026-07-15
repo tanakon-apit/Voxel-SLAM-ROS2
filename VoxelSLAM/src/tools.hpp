@@ -5,6 +5,31 @@
 #include <unordered_map>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
+#include <cmath>
+#include <chrono>
+#include <cstdint>
+#include <builtin_interfaces/msg/time.hpp>
+
+// ---- ROS1 -> ROS2 compatibility helpers ----
+// Convert a builtin_interfaces/Time (message stamp) to seconds.
+static inline double toSec(const builtin_interfaces::msg::Time &t)
+{
+  return static_cast<double>(t.sec) + static_cast<double>(t.nanosec) * 1e-9;
+}
+// Set a builtin_interfaces/Time from seconds (replaces ROS1 stamp.fromSec()).
+static inline void fromSec(builtin_interfaces::msg::Time &t, double s)
+{
+  double secs = std::floor(s);
+  t.sec = static_cast<int32_t>(secs);
+  t.nanosec = static_cast<uint32_t>(std::llround((s - secs) * 1e9));
+}
+// Monotonic wall time in seconds (replaces ros::Time::now().toSec() used for timing).
+static inline double get_time_sec()
+{
+  return std::chrono::duration<double>(
+           std::chrono::steady_clock::now().time_since_epoch())
+    .count();
+}
 
 #define HASH_P 116101
 #define MAX_N 10000000000

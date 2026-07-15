@@ -1,53 +1,68 @@
-cmake_minimum_required(VERSION 3.0.2)
+cmake_minimum_required(VERSION 3.8)
 project(voxel_slam)
 
-set(CMAKE_BUILD_TYPE "Release")
-# set(CMAKE_CXX_FLAGS "-std=c++14")
-# set(CMAKE_CXX_FLAGS_RELEASE "-O3 -Wall -g")
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE "Release")
+endif()
 
-ADD_COMPILE_OPTIONS(-std=c++14 )
-set(CMAKE_CXX_FLAGS "-std=c++14 -O3" )
-
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fexceptions" )
-set(CMAKE_CXX_STANDARD 14)
+# ROS 2 Humble / GTSAM 4.2 build with C++17.
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions")
+add_compile_options(-O3)
 
-find_package(catkin REQUIRED COMPONENTS
-  roscpp
-  rospy
-  std_msgs
-  pcl_conversions
-  pcl_ros
-  livox_ros_driver
-)
+# ---- ament / ROS 2 dependencies ----
+find_package(ament_cmake REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(std_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
+find_package(pcl_conversions REQUIRED)
+find_package(livox_ros_driver2 REQUIRED)
 
+# ---- third-party ----
 find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED)
-find_package(GTSAM REQUIRED QUIET)
-# find_package(Ceres REQUIRED)
+find_package(GTSAM REQUIRED)
+find_package(traversability_msgs REQUIRED)
 
-catkin_package(
-  CATKIN_DEPENDS geometry_msgs nav_msgs roscpp rospy std_msgs 
-  DEPENDS EIGEN3 PCL GTSAM
-  INCLUDE_DIRS
-)
-
-include_directories(
-  include
-  ${catkin_INCLUDE_DIRS}
-  ${PCL_INCLUDE_DIRS}
-# ${CERES_INCLUDE_DIRS}
-  ${GTSAM_INCLUDE_DIR}
+set(ROS_DEPS
+  rclcpp
+  std_msgs
+  sensor_msgs
+  geometry_msgs
+  nav_msgs
+  visualization_msgs
+  tf2
+  tf2_ros
+  pcl_conversions
+  livox_ros_driver2
+  traversability_msgs
 )
 
 add_executable(voxelslam src/voxelslam.cpp src/BTC.cpp)
-target_link_libraries(voxelslam ${catkin_LIBRARIES} ${PCL_LIBRARIES} gtsam)
 
+target_include_directories(voxelslam PRIVATE
+  ${PCL_INCLUDE_DIRS}
+  ${EIGEN3_INCLUDE_DIRS}
+  ${GTSAM_INCLUDE_DIR}
+)
 
+ament_target_dependencies(voxelslam ${ROS_DEPS})
 
+target_link_libraries(voxelslam
+  ${PCL_LIBRARIES}
+  gtsam
+)
 
+install(TARGETS voxelslam
+  DESTINATION lib/${PROJECT_NAME})
 
+install(DIRECTORY launch config rviz_cfg
+  DESTINATION share/${PROJECT_NAME})
 
-
+ament_package()

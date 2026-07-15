@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include "tools.hpp"
 #include "ekf_imu.hpp"
 #include "voxel_map.hpp"
@@ -7,12 +8,22 @@
 #include "loop_refine.hpp"
 #include <mutex>
 #include <Eigen/Eigenvalues>
-#include <tf/transform_broadcaster.h>
-#include <visualization_msgs/MarkerArray.h>
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/imu.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <nav_msgs/msg/odometry.hpp>
+#include <nav_msgs/msg/path.hpp>
+#include <std_msgs/msg/header.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <livox_ros_driver2/msg/custom_msg.hpp>
+#include <traversability_msgs/msg/key_frame.hpp>
+#include <traversability_msgs/msg/key_frame_additions.hpp>
+#include <traversability_msgs/msg/key_frame_updates.hpp>
+#include <pcl_conversions/pcl_conversions.h>
+#include <tf2_ros/transform_broadcaster.h>
+#include <geometry_msgs/msg/transform_stamped.hpp>
 #include <malloc.h>
-#include <geometry_msgs/PoseArray.h>
 #include <pcl/kdtree/kdtree_flann.h>
-#include <malloc.h>
 #include <gtsam/inference/Symbol.h>
 #include <gtsam/navigation/ImuFactor.h>
 #include <gtsam/navigation/CombinedImuFactor.h>
@@ -24,24 +35,172 @@
 
 using namespace std;
 
-ros::Publisher pub_scan, pub_cmap, pub_init, pub_pmap;
-ros::Publisher pub_test, pub_prev_path, pub_curr_path;
-ros::Subscriber sub_imu, sub_pcl;
+using PubCloud = rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr;
+rclcpp::Node::SharedPtr g_node;
+std::shared_ptr<tf2_ros::TransformBroadcaster> g_tf_br;
+PubCloud pub_scan, pub_cmap, pub_init, pub_pmap;
+PubCloud pub_test, pub_prev_path, pub_curr_path;
+rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_odom;
+// Corrected (SLAM/map-frame) odometry — jumps at loop closures. Published
+// alongside the continuous /Odometry so consumers can pick their world.
+rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_odom_corrected;
+// Keyframe trajectory as stamped poses WITH orientation (nav_msgs/Path),
+// republished corrected after loop closure. Consumers (e.g. the keyframe
+// terrain map) anchor data to these poses and re-render when they move.
+rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_kf_path;
+// Observation outputs for the REP-105 (continuous-odometry) experiment.
+// pub_path_corrected — live trajectory in the SLAM (corrected) world;
+//   loop_update() rigidly moves the WHOLE stored history by dx, so this
+//   path snaps at a loop closure exactly like the internal map does.
+// pub_path_continuous — same trajectory with every closure correction
+//   folded into g_T_map_odom instead of the pose; never jumps. This is
+//   what a future odom->base_link output would look like.
+rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_path_corrected;
+rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_path_continuous;
+// Per-scan pose-health flag for downstream mapping consumers.
+// stamp = scan time; frame_id = "degenerate" while scan matching is failing
+// (degrade_cnt > 0) or within General.degen_grace seconds after a system
+// reset (post-reset settling); "ok" otherwise. The elevation mapping node
+// drops point-cloud frames whose stamp falls in a degenerate interval.
+rclcpp::Publisher<std_msgs::msg::Header>::SharedPtr pub_degen;
+// Keyframe export for the traversability_mapping library (suchetanrs):
+// additions when a keyframe settles, updates with corrected poses after a
+// loop closure. Created only when General/pub_trav_keyframes is true.
+rclcpp::Publisher<traversability_msgs::msg::KeyFrameAdditions>::SharedPtr pub_trav_add;
+rclcpp::Publisher<traversability_msgs::msg::KeyFrameUpdates>::SharedPtr pub_trav_upd;
+rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu;
+rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl;
+rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox;
+
+// Frame names for the published TF and clouds. Defaults keep the original
+// standalone-SLAM behaviour (camera_init/aft_mapped). Override via params
+// (e.g. odom/base_link) to plug into a nav2/tf tree. g_odom_topic != "" enables
+// a nav_msgs/Odometry publisher.
+std::string g_world_frame = "camera_init";
+std::string g_body_frame  = "aft_mapped";
+std::string g_odom_topic  = "";
+// REP-105 split (opt-in): when non-empty, pub_odom_func publishes
+//   world_frame -> odom_frame  = g_T_map_odom   (jumps at loop closures)
+//   odom_frame  -> body_frame  = continuous pose (never jumps)
+// and /Odometry carries the CONTINUOUS pose in odom_frame. When empty
+// (default), behaviour is byte-identical to the original single-TF output.
+std::string g_odom_frame  = "";
+// Traversability keyframe export (off by default; see pub_trav_add above).
+// trav_kf_dist throttles additions by travelled distance — the library keeps
+// one point cloud in RAM per added keyframe.
+bool g_pub_trav = false;
+double g_trav_kf_dist = 0.5;
+// Accumulated loop-closure correction (the future map->odom transform in
+// REP-105 terms). Updated only inside loop_update(), which runs on the same
+// odometry thread that publishes — no locking needed. continuous_pose =
+// g_T_map_odom.inverse() * corrected_pose is bitwise-continuous across a
+// closure because the same dx enters both.
+Eigen::Isometry3d g_T_map_odom = Eigen::Isometry3d::Identity();
+// Pose-health flag state (see pub_degen). g_last_reset_time is the scan time
+// of the last system_reset(); flags stay "degenerate" for g_degen_grace
+// seconds afterwards to cover post-reset re-initialization settling.
+double g_degen_grace = 3.0;
+double g_last_reset_time = -1e18;
+// After a system_reset the odom world restarts at the origin: everything
+// downstream consumers accumulated in the old odom frame is invalid. The
+// first per-scan flag after a reset carries frame_id "reset" (consumers
+// treat it as degenerate AND discard their odom-frame state).
+bool g_reset_pending = false;
+// PV-LIO-style stationary initialization (General.static_init): when the
+// first IMU window is stationary, initialize gravity/bias from the IMU
+// average and skip the motion BA (whose free-gravity estimate is
+// unobservable without excitation and trips the |g| gate -> reset-retry).
+bool g_static_init = false;
+// Backing buffers for the two observation paths (~2 Hz appends).
+nav_msgs::msg::Path g_path_corrected, g_path_continuous;
+int g_path_decim = 0;
 
 template <typename T>
-void pub_pl_func(T &pl, ros::Publisher &pub)
+void pub_pl_func(T &pl, PubCloud &pub)
 {
+  // Guard against the shutdown window: worker threads may still call this
+  // after the context is invalidated by a SIGINT/SIGTERM handler.
+  if(!rclcpp::ok() || !g_node || !pub) return;
   pl.height = 1; pl.width = pl.size();
-  sensor_msgs::PointCloud2 output;
+  sensor_msgs::msg::PointCloud2 output;
   pcl::toROSMsg(pl, output);
-  output.header.frame_id = "camera_init";
-  output.header.stamp = ros::Time::now();
-  pub.publish(output);
+  output.header.frame_id = g_world_frame;
+  output.header.stamp = g_node->now();
+  pub->publish(output);
+}
+
+// Publish the keyframe trajectory as nav_msgs/Path (stamped poses with
+// orientation). `tail` may add not-yet-settled keyframes after the main list.
+// Pose stamps carry the scan time (x.t) so consumers can match data captured
+// at that moment; after loop_update the same stamps reappear with corrected
+// poses, signalling a re-anchor.
+inline void pub_kf_path_func(const std::vector<ScanPose*> &poses,
+                             const std::deque<ScanPose*> &tail)
+{
+  if(!rclcpp::ok() || !g_node || !pub_kf_path) return;
+  nav_msgs::msg::Path path;
+  path.header.frame_id = g_world_frame;
+  path.header.stamp = g_node->now();
+  path.poses.reserve(poses.size() + tail.size());
+  auto add = [&path](const IMUST &x)
+  {
+    geometry_msgs::msg::PoseStamped ps;
+    ps.header.frame_id = path.header.frame_id;
+    ps.header.stamp = rclcpp::Time(static_cast<int64_t>(x.t * 1e9));
+    ps.pose.position.x = x.p[0];
+    ps.pose.position.y = x.p[1];
+    ps.pose.position.z = x.p[2];
+    Eigen::Quaterniond q(x.R);
+    q.normalize();
+    ps.pose.orientation.w = q.w();
+    ps.pose.orientation.x = q.x();
+    ps.pose.orientation.y = q.y();
+    ps.pose.orientation.z = q.z();
+    path.poses.push_back(ps);
+  };
+  for(const ScanPose *bl: poses) add(bl->x);
+  for(const ScanPose *bl: tail) add(bl->x);
+  pub_kf_path->publish(path);
+}
+
+// Fill one traversability_msgs/KeyFrame from a SLAM state. kf_pointcloud is
+// left empty on purpose: traversability_node buffers the lidar topic itself
+// (use_lidar_pointcloud: true) and matches by timestamp, so the stamp must be
+// the scan time x.t (same time base as the lidar message headers).
+inline traversability_msgs::msg::KeyFrame make_trav_kf(uint64_t id, const IMUST &x)
+{
+  traversability_msgs::msg::KeyFrame kf;
+  kf.kf_timestamp_in_nanosec = static_cast<uint64_t>(x.t * 1e9);
+  kf.kf_id = id;
+  kf.map_id = 0;
+  kf.kf_pose.position.x = x.p[0];
+  kf.kf_pose.position.y = x.p[1];
+  kf.kf_pose.position.z = x.p[2];
+  Eigen::Quaterniond q(x.R);
+  q.normalize();
+  kf.kf_pose.orientation.w = q.w();
+  kf.kf_pose.orientation.x = q.x();
+  kf.kf_pose.orientation.y = q.y();
+  kf.kf_pose.orientation.z = q.z();
+  return kf;
+}
+
+// ROS2 replacement for ros::NodeHandle::param<T>(name, val, default).
+// Nested YAML keys are addressed with '.' in ROS2, so "General/lid_topic"
+// is translated to "General.lid_topic" before declaring/getting.
+template<typename T>
+void get_param(const rclcpp::Node::SharedPtr &n, const std::string &name, T &val, const T &def)
+{
+  std::string key = name;
+  std::replace(key.begin(), key.end(), '/', '.');
+  if(!n->has_parameter(key))
+    n->declare_parameter<T>(key, def);
+  n->get_parameter(key, val);
 }
 
 mutex mBuf;
 Features feat;
-deque<sensor_msgs::Imu::Ptr> imu_buf;
+deque<sensor_msgs::msg::Imu::SharedPtr> imu_buf;
 deque<pcl::PointCloud<PointType>::Ptr> pcl_buf;
 deque<double> time_buf;
 
@@ -49,26 +208,26 @@ double imu_last_time = -1;
 int point_notime = 0;
 double last_pcl_time = -1;
 
-void imu_handler(const sensor_msgs::Imu::ConstPtr &msg_in)
+void imu_handler(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
 {
   static int flag = 1;
   if(flag)
   {
     flag = 0;
-    printf("Time0: %lf\n", msg_in->header.stamp.toSec());
+    printf("Time0: %lf\n", toSec(msg_in->header.stamp));
   }
 
-  sensor_msgs::Imu::Ptr msg(new sensor_msgs::Imu(*msg_in));
+  sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
 
   // For Hilti 2022 exp03
   // double t0 = 1646320760 + 255.5;
   // double t1 = 1646320760 + 256.2;
-  // double tc = msg->header.stamp.toSec();
+  // double tc = toSec(msg->header.stamp);
   // if(tc > t0 && tc < t1)
   //   msg->linear_acceleration.z = -9.7;
 
   mBuf.lock();
-  imu_last_time = msg->header.stamp.toSec();
+  imu_last_time = toSec(msg->header.stamp);
   imu_buf.push_back(msg);
   mBuf.unlock();
 }
@@ -102,7 +261,7 @@ void pcl_handler(T &msg)
   mBuf.unlock();
 }
 
-bool sync_packages(pcl::PointCloud<PointType>::Ptr &pl_ptr, deque<sensor_msgs::Imu::Ptr> &imus, IMUEKF &p_imu)
+bool sync_packages(pcl::PointCloud<PointType>::Ptr &pl_ptr, deque<sensor_msgs::msg::Imu::SharedPtr> &imus, IMUEKF &p_imu)
 {
   static bool pl_ready = false;
 
@@ -137,10 +296,10 @@ bool sync_packages(pcl::PointCloud<PointType>::Ptr &pl_ptr, deque<sensor_msgs::I
   if(!pl_ready || imu_last_time <= p_imu.pcl_end_time) return false;
 
   mBuf.lock();
-  double imu_time = imu_buf.front()->header.stamp.toSec();
-  while((!imu_buf.empty()) && (imu_time < p_imu.pcl_end_time)) 
+  double imu_time = toSec(imu_buf.front()->header.stamp);
+  while((!imu_buf.empty()) && (imu_time < p_imu.pcl_end_time))
   {
-    imu_time = imu_buf.front()->header.stamp.toSec();
+    imu_time = toSec(imu_buf.front()->header.stamp);
     if(imu_time > p_imu.pcl_end_time) break;
     imus.push_back(imu_buf.front());
     imu_buf.pop_front();
@@ -278,7 +437,7 @@ double get_memory()
   return mem / (1048576);
 }
 
-void icp_check(pcl::PointCloud<PointType> &pl_src, pcl::PointCloud<PointType> &pl_tar, ros::Publisher &pub_src, ros::Publisher &pub_tar, pair<Eigen::Vector3d, Eigen::Matrix3d> &loop_transform, IMUST &xx)
+void icp_check(pcl::PointCloud<PointType> &pl_src, pcl::PointCloud<PointType> &pl_tar, PubCloud &pub_src, PubCloud &pub_tar, pair<Eigen::Vector3d, Eigen::Matrix3d> &loop_transform, IMUST &xx)
 {
   pcl::PointCloud<PointType> pl1, pl2;
   for(PointType ap: pl_src.points)

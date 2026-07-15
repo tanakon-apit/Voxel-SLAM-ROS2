@@ -8,7 +8,7 @@
 #include <unordered_set>
 #include <mutex>
 
-#include <ros/ros.h>
+#include "tools.hpp"
 #include <fstream>
 
 struct pointVar 
@@ -87,6 +87,39 @@ int max_points = 100;
 double voxel_size = 1.0;
 int min_ba_point = 20;
 vector<double> plane_eigen_value_thre;
+
+// Odometry/fix_plane_init. Off reproduces stock VoxelSLAM exactly.
+//
+// plane_update() -- the only writer of plane.center/normal/radius -- runs
+// behind `pcr_fix.N < max_points` in margi(). That reads as "stop refreshing a
+// plane once the voxel is saturated", and for a voxel that fills up gradually
+// it is: by the time it passes max_points it was initialized long ago.
+//
+// But loop_update() rebuilds the map from keyframes, dumping thousands of
+// points into every voxel at once. Those voxels are born saturated, so the
+// guard blocks the FIRST write, not a refresh. recut() still sets is_plane, and
+// the voxel ends up advertising a plane with center = normal = 0, radius = 0.
+// The association gate `range_dis <= 9*radius` then rejects every point, so the
+// EKF goes blind across the whole rebuilt map. Measured on x30_mid360: 7919 of
+// 9260 scan points hit such a voxel on the first scan after the closure.
+//
+// When on, plane_update() is additionally allowed to run for a plane that has
+// no geometry yet. Voxels that grew normally are unaffected (radius > 0 already).
+//
+// Measured A/B on x30_mid360 (1003 s, 1 loop closure), on vs off: points landing
+// on a geometry-less plane fell 520368 -> 13258, trajectory was unchanged (mean
+// divergence 1.0 cm, final position slightly closer to origin), and it cost no
+// time. Not 100%: plane_update() is only reached from margi(), which visits only
+// sliding-window voxels, so a keyframe voxel the robot never re-approaches still
+// never gets initialized.
+//
+// Caveat if you turn this on: the fixed path is push_fix_novar(), which does not
+// accumulate cov_add. plane_update() therefore derives plane_var from a zero
+// covariance, so the plane claims zero uncertainty of its own and the EKF weights
+// it by measurement noise alone -- overconfident. Benign in the A/B above, but
+// the principled fix is to have that path accumulate cov_add (push_fix already
+// does; only push_fix_novar skips it).
+bool fix_plane_init = false;
 
 void Bf_var(const pointVar &pv, Eigen::Matrix<double, 9, 9> &bcov, const Eigen::Vector3d &vec)
 {
@@ -381,7 +414,7 @@ public:
 
     bool is_converge = true;
 
-    // double tt1 = ros::Time::now().toSec();
+    // double tt1 = get_time_sec();
     // for(int i=0; i<10; i++)
     for(int i=0; i<max_iter; i++)
     {
@@ -582,9 +615,9 @@ public:
     {
       if(is_calc_hess)
       {
-        double tm = ros::Time::now().toSec();
+        double tm = get_time_sec();
         residual1 = divide_thread(x_stats, voxhess, imus_factor, Hess, JacT);
-        hesstime += ros::Time::now().toSec() - tm;
+        hesstime += get_time_sec() - tm;
         *hess = Hess;
       }
       
@@ -610,9 +643,9 @@ public:
 
       double q1 = 0.5 * dxi.dot(u*D*dxi-JacT);
 
-      double tl1 = ros::Time::now().toSec();
+      double tl1 = get_time_sec();
       residual2 = only_residual(x_stats_temp, voxhess, imus_factor);
-      double tl2 = ros::Time::now().toSec();
+      double tl2 = get_time_sec();
       // printf("onlyresi: %lf\n", tl2-tl1);
       resitime += tl2 - tl1;
 
@@ -1246,7 +1279,9 @@ public:
         
       }
 
-      if(pcr_fix.N < max_points && plane.is_plane)
+      // radius <= 0 means plane_update() has never run for this plane -- see
+      // fix_plane_init. Initializing is not the same as refreshing.
+      if(plane.is_plane && (pcr_fix.N < max_points || (fix_plane_init && plane.radius <= 0)))
       if(pcr_add.N - last_num >= 5 || last_num <= 10)
       {
         plane_update();
