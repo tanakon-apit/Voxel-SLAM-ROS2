@@ -27,15 +27,62 @@ Voxel-SLAM served as a subsystem in the [ICRA HILTI 2023 SLAM Challenge](https:/
 
 - Ubuntu 22.04 with [ROS 2 Humble](https://docs.ros.org/en/humble/Installation.html)
 - [PCL](https://pointclouds.org/) and [Eigen](https://eigen.tuxfamily.org/) (the versions shipped with ROS 2 Humble work)
-- [GTSAM 4.2](https://github.com/borglab/gtsam) (the port is built with C++17, as required by GTSAM 4.2 / Humble)
-- [livox_ros_driver2](https://github.com/Livox-SDK/livox_ros_driver2) (optional) — provides the `livox_ros_driver2/msg/CustomMsg` type, needed only for Livox sensors (`lidar_type: 0`). If it is not found at build time, the package builds without Livox support and the PointCloud2 LiDARs (Velodyne/Ouster/Hesai/…) still work; requesting `lidar_type: 0` then exits with an error at startup. To enable Livox support, either clone the driver into the same workspace `src/`, or build it in its own workspace and source that workspace before building or running:
+- [GTSAM](https://github.com/borglab/gtsam) ≥ 4.1 (the port is built with C++17)
+- `traversability_msgs` (from [traversability_mapping](https://github.com/suchetanrs/traversability_mapping)) — message definitions for the optional traversability key-frame outputs (see §6). A build dependency even if you don't use that feature.
+- [livox_ros_driver2](https://github.com/Livox-SDK/livox_ros_driver2) (optional) — provides the `livox_ros_driver2/msg/CustomMsg` type, needed only for Livox sensors (`lidar_type: 0`). If it is not found at build time, the package builds without Livox support and the PointCloud2 LiDARs (Velodyne/Ouster/Hesai/…) still work; requesting `lidar_type: 0` then exits with an error at startup.
 
-  ```bash
-  source /opt/ros/humble/setup.bash
-  source <livox_driver_ws>/install/setup.bash   # provides livox_ros_driver2
-  ```
+### 2.1 Installing the dependencies
 
-- `traversability_msgs` — only needed for the optional traversability key-frame outputs (see §6).
+**ROS 2 Humble** — follow the [official installation guide](https://docs.ros.org/en/humble/Installation/Ubuntu-Install-Debs.html), then install the ROS packages this node uses (PCL and Eigen come in as their dependencies):
+
+```bash
+sudo apt install ros-humble-desktop            # or ros-humble-ros-base + ros-humble-rviz2
+sudo apt install ros-humble-pcl-ros ros-humble-pcl-conversions \
+                 ros-humble-tf2-ros python3-colcon-common-extensions
+```
+
+**GTSAM** — easiest from the Borglab PPA:
+
+```bash
+sudo add-apt-repository ppa:borglab/gtsam-release-4.1
+sudo apt update
+sudo apt install libgtsam-dev libgtsam-unstable-dev
+```
+
+(Building [GTSAM](https://github.com/borglab/gtsam) 4.1/4.2 from source also works.)
+
+**traversability_msgs** — clone the repository into your workspace `src/` and build the message package (the rest of that repository is not required):
+
+```bash
+cd <your_ros2_ws>/src
+git clone https://github.com/suchetanrs/traversability_mapping
+cd ..
+colcon build --packages-select traversability_msgs
+```
+
+**livox_ros_driver2** (optional, for Livox sensors) — the driver needs the [Livox-SDK2](https://github.com/Livox-SDK/Livox-SDK2) library first:
+
+```bash
+# 1. Livox-SDK2 (system-wide install)
+git clone https://github.com/Livox-SDK/Livox-SDK2
+cd Livox-SDK2 && mkdir build && cd build
+cmake .. && make -j
+sudo make install
+
+# 2. the ROS 2 driver, in its own workspace (its build script requires it)
+mkdir -p <livox_driver_ws>/src && cd <livox_driver_ws>/src
+git clone https://github.com/Livox-SDK/livox_ros_driver2
+cd livox_ros_driver2
+source /opt/ros/humble/setup.bash
+./build.sh humble
+```
+
+Then source `<livox_driver_ws>/install/setup.bash` before building or running `voxel_slam` (alternatively, clone the driver into the same workspace `src/` so it builds alongside):
+
+```bash
+source /opt/ros/humble/setup.bash
+source <livox_driver_ws>/install/setup.bash   # provides livox_ros_driver2
+```
 
 ## 3. Build
 
