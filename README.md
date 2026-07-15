@@ -65,6 +65,14 @@ sudo apt install libgtsam-dev
 > ```bash
 > sudo ar rc /usr/lib/x86_64-linux-gnu/libCppUnitLite.a
 > ```
+>
+> If the build then fails with `No rule to make target '/usr/lib/x86_64-linux-gnu/libmetis.so'`, the same Ubuntu GTSAM
+> package links against system METIS but only the runtime library (`libmetis5`) is installed; the unversioned `.so`
+> comes from the dev package:
+>
+> ```bash
+> sudo apt install libmetis-dev
+> ```
 
 **traversability_msgs** — clone the repository into your workspace `src/` and build the message package (the rest of that repository is not required):
 
