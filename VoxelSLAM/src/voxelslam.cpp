@@ -1036,9 +1036,18 @@ public:
       imu_topic, rclcpp::QoS(rclcpp::KeepLast(5000)),
       [](const sensor_msgs::msg::Imu::ConstSharedPtr msg){ imu_handler(msg); });
     if(feat.lidar_type == LIVOX)
+#ifdef VOXELSLAM_WITH_LIVOX
       sub_pcl_livox = n->create_subscription<livox_ros_driver2::msg::CustomMsg>(
         lid_topic, rclcpp::QoS(rclcpp::KeepLast(1000)),
         [](const livox_ros_driver2::msg::CustomMsg::ConstSharedPtr msg){ pcl_handler(msg); });
+#else
+    {
+      RCLCPP_FATAL(n->get_logger(),
+        "lidar_type 0 (Livox CustomMsg) requested, but voxel_slam was built "
+        "without livox_ros_driver2. Rebuild with the driver available.");
+      exit(1);
+    }
+#endif
     else
       sub_pcl = n->create_subscription<sensor_msgs::msg::PointCloud2>(
         lid_topic, rclcpp::QoS(rclcpp::KeepLast(1000)),
@@ -3099,7 +3108,9 @@ int main(int argc, char **argv)
   // (pub_odom*, pub_trav_*) are listed unconditionally.
   sub_imu.reset();
   sub_pcl.reset();
+#ifdef VOXELSLAM_WITH_LIVOX
   sub_pcl_livox.reset();
+#endif
   pub_scan.reset();      pub_cmap.reset();      pub_init.reset();
   pub_pmap.reset();      pub_test.reset();      pub_prev_path.reset();
   pub_curr_path.reset(); pub_kf_path.reset();

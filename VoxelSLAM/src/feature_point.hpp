@@ -4,7 +4,9 @@
 #include "tools.hpp"
 #include <pcl_conversions/pcl_conversions.h>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#ifdef VOXELSLAM_WITH_LIVOX
 #include <livox_ros_driver2/msg/custom_msg.hpp>
+#endif
 
 typedef pcl::PointXYZINormal PointType;
 using namespace std;
@@ -100,11 +102,13 @@ public:
   double blind = 1;
   double omega_l = 3610;
 
+#ifdef VOXELSLAM_WITH_LIVOX
   double process(const livox_ros_driver2::msg::CustomMsg::ConstSharedPtr &msg, pcl::PointCloud<PointType> &pl_full)
   {
     livox_handler(msg, pl_full);
     return toSec(msg->header.stamp);
   }
+#endif
 
   double process(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg, pcl::PointCloud<PointType> &pl_full)
   {
@@ -139,8 +143,9 @@ public:
     return t0;
   }
 
+#ifdef VOXELSLAM_WITH_LIVOX
   void livox_handler(const livox_ros_driver2::msg::CustomMsg::ConstSharedPtr &msg, pcl::PointCloud<PointType> &pl_full)
-  { 
+  {
     int plsize = msg->point_num;
     pl_full.reserve(plsize);
 
@@ -165,6 +170,7 @@ public:
     }
 
   }
+#endif
 
   void velodyne_handler(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg, pcl::PointCloud<PointType> &pl_full)
   {

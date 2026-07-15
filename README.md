@@ -28,11 +28,11 @@ Voxel-SLAM served as a subsystem in the [ICRA HILTI 2023 SLAM Challenge](https:/
 - Ubuntu 22.04 with [ROS 2 Humble](https://docs.ros.org/en/humble/Installation.html)
 - [PCL](https://pointclouds.org/) and [Eigen](https://eigen.tuxfamily.org/) (the versions shipped with ROS 2 Humble work)
 - [GTSAM 4.2](https://github.com/borglab/gtsam) (the port is built with C++17, as required by GTSAM 4.2 / Humble)
-- [livox_ros_driver2](https://github.com/Livox-SDK/livox_ros_driver2) — provides the `livox_ros_driver2/msg/CustomMsg` type. It is typically built in its own workspace; source that workspace before building or running:
+- [livox_ros_driver2](https://github.com/Livox-SDK/livox_ros_driver2) (optional) — provides the `livox_ros_driver2/msg/CustomMsg` type, needed only for Livox sensors (`lidar_type: 0`). If it is not found at build time, the package builds without Livox support and the PointCloud2 LiDARs (Velodyne/Ouster/Hesai/…) still work; requesting `lidar_type: 0` then exits with an error at startup. To enable Livox support, either clone the driver into the same workspace `src/`, or build it in its own workspace and source that workspace before building or running:
 
   ```bash
   source /opt/ros/humble/setup.bash
-  source ~/livox_ws/install/setup.bash   # provides livox_ros_driver2
+  source <livox_driver_ws>/install/setup.bash   # provides livox_ros_driver2
   ```
 
 - `traversability_msgs` — only needed for the optional traversability key-frame outputs (see §6).
@@ -40,9 +40,9 @@ Voxel-SLAM served as a subsystem in the [ICRA HILTI 2023 SLAM Challenge](https:/
 ## 3. Build
 
 ```bash
-cd ~/dti_ws
+cd <your_ros2_ws>
 source /opt/ros/humble/setup.bash
-source ~/livox_ws/install/setup.bash
+source <livox_driver_ws>/install/setup.bash   # optional, only for Livox support (see §2)
 colcon build --packages-select voxel_slam
 source install/setup.bash
 ```
@@ -69,7 +69,7 @@ All launch files accept `rviz:=false` to disable RViz2.
 ros2 launch voxel_slam vxlm_mid360.launch.py
 # or run the node directly:
 ros2 run voxel_slam voxelslam --ros-args \
-  --params-file src/Voxel-SLAM/VoxelSLAM/config/mid360.yaml
+  --params-file $(ros2 pkg prefix voxel_slam)/share/voxel_slam/config/mid360.yaml
 ```
 
 To replay data manually, play a ROS 2 bag in another terminal:

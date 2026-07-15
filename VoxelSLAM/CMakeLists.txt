@@ -22,7 +22,9 @@ find_package(visualization_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(pcl_conversions REQUIRED)
-find_package(livox_ros_driver2 REQUIRED)
+# Livox support is optional: without livox_ros_driver2 the node still builds
+# and runs every PointCloud2 lidar_type, it just cannot subscribe to CustomMsg.
+find_package(livox_ros_driver2 QUIET)
 
 # ---- third-party ----
 find_package(Eigen3 REQUIRED)
@@ -40,9 +42,15 @@ set(ROS_DEPS
   tf2
   tf2_ros
   pcl_conversions
-  livox_ros_driver2
   traversability_msgs
 )
+if(livox_ros_driver2_FOUND)
+  list(APPEND ROS_DEPS livox_ros_driver2)
+  add_compile_definitions(VOXELSLAM_WITH_LIVOX)
+  message(STATUS "voxel_slam: building WITH Livox CustomMsg support")
+else()
+  message(STATUS "voxel_slam: livox_ros_driver2 not found, building WITHOUT Livox CustomMsg support (lidar_type 0 disabled)")
+endif()
 
 add_executable(voxelslam src/voxelslam.cpp src/BTC.cpp)
 

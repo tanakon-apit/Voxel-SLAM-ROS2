@@ -15,7 +15,9 @@
 #include <nav_msgs/msg/path.hpp>
 #include <std_msgs/msg/header.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#ifdef VOXELSLAM_WITH_LIVOX
 #include <livox_ros_driver2/msg/custom_msg.hpp>
+#endif
 #include <traversability_msgs/msg/key_frame.hpp>
 #include <traversability_msgs/msg/key_frame_additions.hpp>
 #include <traversability_msgs/msg/key_frame_updates.hpp>
@@ -70,7 +72,9 @@ rclcpp::Publisher<traversability_msgs::msg::KeyFrameAdditions>::SharedPtr pub_tr
 rclcpp::Publisher<traversability_msgs::msg::KeyFrameUpdates>::SharedPtr pub_trav_upd;
 rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu;
 rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl;
+#ifdef VOXELSLAM_WITH_LIVOX
 rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox;
+#endif
 
 // Frame names for the published TF and clouds. Defaults keep the original
 // standalone-SLAM behaviour (camera_init/aft_mapped). Override via params
