@@ -41,15 +41,30 @@ sudo apt install ros-humble-pcl-ros ros-humble-pcl-conversions \
                  ros-humble-tf2-ros python3-colcon-common-extensions
 ```
 
-**GTSAM** — easiest from the Borglab PPA:
+**GTSAM** — either of these works:
 
 ```bash
+# Option A: GTSAM 4.2 from the ROS repository (simplest, no extra PPA)
+sudo apt install ros-humble-gtsam
+
+# Option B: GTSAM 4.1 from the Borglab PPA
 sudo add-apt-repository ppa:borglab/gtsam-release-4.1
 sudo apt update
-sudo apt install libgtsam-dev libgtsam-unstable-dev
+sudo apt install libgtsam-dev
 ```
 
 (Building [GTSAM](https://github.com/borglab/gtsam) 4.1/4.2 from source also works.)
+
+> **Troubleshooting:** if `find_package(GTSAM)` fails with
+> `The imported target "CppUnitLite" references the file "/usr/lib/x86_64-linux-gnu/libCppUnitLite.a" but this file does not exist`,
+> you have the `libgtsam-dev` package from the plain Ubuntu archive (`4.1.1-1ubuntuXX`), which has a packaging bug: its CMake
+> config exports the `CppUnitLite` target but the package doesn't ship the library. Either install GTSAM from one of the two
+> sources above instead, or satisfy the check with an empty stub archive (nothing actually links against it — it is only
+> GTSAM's internal test helper):
+>
+> ```bash
+> sudo ar rc /usr/lib/x86_64-linux-gnu/libCppUnitLite.a
+> ```
 
 **traversability_msgs** — clone the repository into your workspace `src/` and build the message package (the rest of that repository is not required):
 
