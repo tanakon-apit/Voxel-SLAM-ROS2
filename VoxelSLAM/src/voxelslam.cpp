@@ -978,6 +978,11 @@ public:
   int thread_num = 5;
   int degrade_bound = 10;
 
+  // Hybrid LIO/LO fallback: enable_lo_fallback and imu_gap_thresh live at
+  // namespace scope (voxelslam.hpp) because sync_packages() reads them; only
+  // lo_max_gap is used solely in this class.
+  double lo_max_gap = 5.0;   // s; an IMU gap longer than this should end in a reset
+
   vector<vector<ScanPose*>*> multimap_scanPoses;
   vector<vector<Keyframe*>*> multimap_keyframes;
   volatile int gba_flag = 0;
@@ -1067,24 +1072,26 @@ public:
     get_param<double>(n, "Odometry/voxel_size", voxel_size, 1);
     get_param<double>(n, "Odometry/min_eigen_value", min_eigen_value, 0.0025);
     get_param<int>(n, "Odometry/degrade_bound", degrade_bound, 10);
-    // Constant-velocity fallback across IMU dropouts (see fill_imu_gaps).
-    get_param<bool>(n, "Odometry/imu_cv_fallback", g_imu_cv_enable, false);
-    get_param<double>(n, "Odometry/imu_gap_thresh", g_imu_gap_thresh, 0.05);
-    get_param<double>(n, "Odometry/imu_cv_cov_scale", g_imu_cv_cov_scale, 100.0);
-    // Rate observer feeding the fallback's held turn rate (doc/imu_cv_fallback.md).
-    get_param<bool>(n, "Odometry/imu_cv_rate_observer", g_rate_obs_enable, false);
-    get_param<double>(n, "Odometry/rate_obs_q", g_rate_obs.q, 0.01);
-    get_param<double>(n, "Odometry/rate_obs_r", g_rate_obs.r, 0.002);
-    get_param<double>(n, "Odometry/rate_obs_var_cap", g_rate_obs.var_cap, 0.04);
     // Let plane_update() initialize a plane that has none (see voxel_map.hpp).
     // CHANGES SLAM OUTPUT. Off = stock behaviour.
     get_param<bool>(n, "Odometry/fix_plane_init", fix_plane_init, false);
     get_param<int>(n, "Odometry/point_notime", point_notime, 0);
     odom_ekf.point_notime = point_notime;
 
+    // Hybrid LIO/LO fallback params (enable_lo_fallback and imu_gap_thresh are
+    // namespace-scope globals declared in voxelslam.hpp).
+    double lo_cov_gyr, lo_cov_acc;
+    get_param<bool>(n, "Odometry/enable_lo_fallback", enable_lo_fallback, true);
+    get_param<double>(n, "Odometry/imu_gap_thresh", imu_gap_thresh, 0.05);
+    get_param<double>(n, "Odometry/lo_max_gap", lo_max_gap, 5.0);
+    get_param<double>(n, "Odometry/lo_cov_gyr", lo_cov_gyr, 1.0);
+    get_param<double>(n, "Odometry/lo_cov_acc", lo_cov_acc, 1.0);
+
     feat.blind = feat.blind * feat.blind;
     odom_ekf.cov_gyr << cov_gyr, cov_gyr, cov_gyr;
     odom_ekf.cov_acc << cov_acc, cov_acc, cov_acc;
+    odom_ekf.cov_gyr_lo << lo_cov_gyr, lo_cov_gyr, lo_cov_gyr;
+    odom_ekf.cov_acc_lo << lo_cov_acc, lo_cov_acc, lo_cov_acc;
     odom_ekf.cov_bias_gyr << rand_walk_gyr, rand_walk_gyr, rand_walk_gyr;
     odom_ekf.cov_bias_acc << rand_walk_acc, rand_walk_acc, rand_walk_acc;
     odom_ekf.Lid_offset_to_IMU  << vecT[0], vecT[1], vecT[2];
@@ -1282,13 +1289,14 @@ public:
 
     for(int iterCount=0; iterCount<num_max_iter; iterCount++)
     {
-      Eigen::Matrix<double, 6, 6> HTH; HTH.setZero();
-      Eigen::Matrix<double, 6, 1> HTz; HTz.setZero();
-      int valid = 0;
+      // Pass 1: (re)associate and collect the signed point-to-plane
+      // residuals, so outliers can be rejected against the residual
+      // DISTRIBUTION of this iteration rather than a fixed threshold.
+      vector<double> pd2s(psize, 0.0);
+      vector<double> res_stat; res_stat.reserve(psize);
       for(int i=0; i<psize; i++)
       {
         pointVar &pv = pptr->at(i);
-        Eigen::Matrix3d phat = hat(pv.pnt);
         Eigen::Vector3d wld = x_curr.R * pv.pnt + x_curr.p;
 
         if(refind)
@@ -1297,26 +1305,34 @@ public:
           apx.x = wld[0]; apx.y = wld[1]; apx.z = wld[2];
           kd_map.nearestKSearch(apx, NMATCH, nearInd, sqdis);
 
-          Eigen::Matrix<double, NMATCH, 3> A;
-          for(int i=0; i<NMATCH; i++)
-          {
-            PointType &pp = pl_tree->points[nearInd[i]];
-            A.row(i) << pp.x, pp.y, pp.z;
-          }
-          Eigen::Vector3d direct = A.colPivHouseholderQr().solve(b);
-          bool check_flag = false;
-          for(int i=0; i<NMATCH; i++)
-          {
-            if(fabs(direct.dot(A.row(i)) + 1.0) > 0.1) 
-              check_flag = true;
-          }
-
-          if(check_flag) 
+          // No genuine counterpart nearby: reject instead of borrowing a
+          // plane from elsewhere in the map (max_dis was unused upstream).
+          if(sqdis[NMATCH-1] > max_dis)
           {
             ds[i] = -1;
             continue;
           }
-          
+
+          Eigen::Matrix<double, NMATCH, 3> A;
+          for(int k=0; k<NMATCH; k++)
+          {
+            PointType &pp = pl_tree->points[nearInd[k]];
+            A.row(k) << pp.x, pp.y, pp.z;
+          }
+          Eigen::Vector3d direct = A.colPivHouseholderQr().solve(b);
+          bool check_flag = false;
+          for(int k=0; k<NMATCH; k++)
+          {
+            if(fabs(direct.dot(A.row(k)) + 1.0) > 0.1)
+              check_flag = true;
+          }
+
+          if(check_flag)
+          {
+            ds[i] = -1;
+            continue;
+          }
+
           double d = 1.0 / direct.norm();
           // direct *= d;
           ds[i] = d;
@@ -1325,15 +1341,47 @@ public:
 
         if(ds[i] >= 0)
         {
-          double pd2 = directs[i].dot(wld) + ds[i];
-          Eigen::Matrix<double, 6, 1> jac_s;
-          jac_s.head(3) = phat * x_curr.R.transpose() * directs[i];
-          jac_s.tail(3) = directs[i];
-
-          HTH += jac_s * jac_s.transpose();
-          HTz += jac_s * (-pd2);
-          valid++;
+          pd2s[i] = directs[i].dot(wld) + ds[i];
+          res_stat.push_back(pd2s[i]);
         }
+      }
+
+      // Robust scale from median + MAD (needs enough samples to be
+      // meaningful; the 0.02 m floor stops over-rejection on clean scenes).
+      double med = 0.0, sigma = 0.05;
+      if(res_stat.size() > 50)
+      {
+        size_t mid = res_stat.size() / 2;
+        nth_element(res_stat.begin(), res_stat.begin()+mid, res_stat.end());
+        med = res_stat[mid];
+        vector<double> devs; devs.reserve(res_stat.size());
+        for(double r: res_stat) devs.push_back(fabs(r - med));
+        nth_element(devs.begin(), devs.begin()+mid, devs.end());
+        sigma = max(1.4826 * devs[mid], 0.02);
+      }
+      const double gate_stat = 3.0 * sigma;   // hard statistical rejection
+      const double huber_k = 1.345 * sigma;   // Huber transition point
+
+      // Pass 2: accumulate with the statistical gate + Huber weights.
+      Eigen::Matrix<double, 6, 6> HTH; HTH.setZero();
+      Eigen::Matrix<double, 6, 1> HTz; HTz.setZero();
+      int valid = 0;
+      for(int i=0; i<psize; i++)
+      {
+        if(ds[i] < 0) continue;
+        double rc = fabs(pd2s[i] - med);
+        if(rc > gate_stat) continue;                    // statistical outlier
+        double w = rc > huber_k ? huber_k / rc : 1.0;   // robust down-weight
+
+        pointVar &pv = pptr->at(i);
+        Eigen::Matrix3d phat = hat(pv.pnt);
+        Eigen::Matrix<double, 6, 1> jac_s;
+        jac_s.head(3) = phat * x_curr.R.transpose() * directs[i];
+        jac_s.tail(3) = directs[i];
+
+        HTH += w * jac_s * jac_s.transpose();
+        HTz += w * jac_s * (-pd2s[i]);
+        valid++;
       }
 
       H_T_H.block<6, 6>(0, 0) = HTH;
@@ -1686,8 +1734,13 @@ public:
     x_curr.p = Eigen::Vector3d(0, 0, 0);
     odom_ekf.mean_acc.setZero();
     odom_ekf.init_num = 0;
-    odom_ekf.IMU_init(imus);
-    x_curr.g = -odom_ekf.mean_acc * imupre_scale_gravity;
+    // Guard against an empty IMU deque (an LO scan carries no IMU). IMU_init
+    // dereferences imus.back(), so only re-seed gravity when IMU is present.
+    if(!imus.empty())
+    {
+      odom_ekf.IMU_init(imus);
+      x_curr.g = -odom_ekf.mean_acc * imupre_scale_gravity;
+    }
 
     for(int i=0; i<imu_pre_buf.size(); i++)
       delete imu_pre_buf[i];
@@ -1857,6 +1910,10 @@ public:
     LidarFactor voxhess(win_size);
     const int mgsize = 1;
     Eigen::MatrixXd hess;
+    // Hybrid LIO/LO mode state: was_lo tracks the previous scan's mode (for
+    // park/restore edge detection); prev_lo_scan gates the BA factor for the
+    // interval that ENDS at this scan.
+    bool lo_scan = false, was_lo = false, prev_lo_scan = false;
     while(rclcpp::ok())
     {
       // Subscriptions are serviced by the executor spinning in main().
@@ -1872,7 +1929,7 @@ public:
       }
 
       deque<sensor_msgs::msg::Imu::SharedPtr> imus;
-      if(!sync_packages(pcl_curr, imus, odom_ekf))
+      if(!sync_packages(pcl_curr, imus, odom_ekf, lo_scan))
       {
         if(octos_release.size() != 0)
         {
@@ -1953,6 +2010,9 @@ public:
         if(init == 1)
         {
           motion_init_flag = 0;
+          // The front-end has completed one successful initialization; from now
+          // on sync_packages() may release LiDAR-only scans on an IMU gap.
+          sys_init_done = true;
         }
         else
         {
@@ -1963,39 +2023,32 @@ public:
       }
       else
       {
-        int n_synth = fill_imu_gaps(imus, x_curr, odom_ekf);
-        static bool cv_active = false;
-        if(n_synth > 0 && !cv_active)
+        // LIO/LO mode transitions (edge-detected against the previous scan).
+        if(lo_scan && !was_lo)
         {
-          cv_active = true;
-          printf("IMU gap at scan t=%.3lf: constant-velocity fallback ON (%d synthetic samples)\n",
-                 odom_ekf.pcl_end_time, n_synth);
+          // LIO -> LO: park real bg/ba/g + cov, seed omega with the averaged
+          // pre-gap gyro, set the omega prior and freeze the accel bias.
+          odom_ekf.park_and_enter_lo(x_curr, odom_ekf.last_frame_mean_gyr);
         }
-        else if(n_synth == 0 && cv_active)
+        else if(!lo_scan && was_lo)
         {
-          cv_active = false;
-          printf("IMU stream recovered at t=%.3lf: back to IMU propagation\n",
-                 odom_ekf.pcl_end_time);
+          // LO -> LIO: restore bg/ba/g + marginal cov, zero stale bias
+          // cross-cov, inflate velocity cov. The fresh IMU_PRE for the first
+          // post-gap interval is rebuilt below from the restored biases.
+          odom_ekf.restore_and_exit_lo(x_curr);
         }
 
-        if(odom_ekf.process(x_curr, *pcl_curr, imus) == 0)
-          continue;
-
-        // A non-finite state cannot recover through registration and would
-        // poison the map until degrade_bound trips; restart immediately.
-        if(!x_curr.p.allFinite() || !x_curr.v.allFinite() || !x_curr.R.allFinite())
+        // Prediction / deskew.
+        if(lo_scan)
         {
-          printf("Non-finite state after propagation: restarting session\n");
-          degrade_cnt = 0;
-          system_reset(imus);
-          last_pos = x_curr.p; jour = 0;
-          mtx_loop.lock();
-          buf_lba2loop_tem.swap(buf_lba2loop);
-          mtx_loop.unlock();
-          reset_flag = 1;
-          motion_init_flag = 1;
-          history_kfsize = 0;
-          continue;
+          // LiDAR-only constant-velocity predictor (holds omega in bg, velocity
+          // in v). No IMU consumed.
+          odom_ekf.cv_motion_blur(x_curr, *pcl_curr, odom_ekf.pcl_beg_time, odom_ekf.pcl_end_time);
+        }
+        else
+        {
+          if(odom_ekf.process(x_curr, *pcl_curr, imus) == 0)
+            continue;
         }
 
         pcl::PointCloud<PointType> pl_down = *pcl_curr;
@@ -2010,21 +2063,12 @@ public:
         PVecPtr pptr(new PVec);
         var_init(extrin_para, pl_down, pptr, dept_err, beam_err);
 
-        bool lio_ok = lio_state_estimation(pptr);
-        if(lio_ok)
+        if(lio_state_estimation(pptr))
         {
           if(degrade_cnt > 0) degrade_cnt--;
         }
         else
           degrade_cnt++;
-
-        // Track the body rate from the corrected orientation (runs with or
-        // without real IMU data; consumed only by fill_imu_gaps). While the
-        // fallback is padding, R is correlated with our own prediction, so
-        // the measurement gets 10x noise.
-        if(g_rate_obs_enable)
-          g_rate_obs.step(x_curr.R, x_curr.t, lio_ok && degrade_cnt == 0,
-                          n_synth > 0 ? 10.0 : 1.0);
 
         // Pose-health flag: degenerate while scan matching fails and during
         // the post-reset grace window. Consumers match by scan stamp.
@@ -2062,10 +2106,27 @@ public:
         pvec_buf.push_back(pptr);
         if(win_count > 1)
         {
-          imu_pre_buf.push_back(new IMU_PRE(x_buf[win_count-2].bg, x_buf[win_count-2].ba));
-          imu_pre_buf[win_count-2]->push_imu(imus);
+          // Push a REAL preintegration factor only when the interval between the
+          // previous scan and this one is fully IMU-covered: neither endpoint is
+          // an LO scan and IMU samples are present. Otherwise push nullptr; the
+          // sliding-window BA optimizers skip null factors (pose-only interval).
+          if(!lo_scan && !prev_lo_scan && !imus.empty())
+          {
+            imu_pre_buf.push_back(new IMU_PRE(x_buf[win_count-2].bg, x_buf[win_count-2].ba));
+            imu_pre_buf[win_count-2]->push_imu(imus);
+          }
+          else
+          {
+            imu_pre_buf.push_back(nullptr);
+          }
         }
-        
+
+        // Advance the LIO/LO mode state for the next scan. Done here (after the
+        // factor push, before any continue) so it updates on every steady-state
+        // iteration.
+        prev_lo_scan = lo_scan;
+        was_lo = lo_scan;
+
         keyframe_loading(jour);
         voxhess.clear(); voxhess.win_size = win_size;
 
@@ -2076,7 +2137,7 @@ public:
         multi_recut(surf_map_slide, win_count, x_buf, voxhess, sws);
         t3 = get_time_sec();
 
-        if(degrade_cnt > degrade_bound)
+        if(degrade_cnt > degrade_bound && !lo_scan)
         {
           degrade_cnt = 0;
           system_reset(imus);
@@ -2116,16 +2177,7 @@ public:
 
         ScanPose *bl = new ScanPose(x_buf[0], pvec_buf[0]);
         bl->v6 = hess.block<6, 6>(0, DIM).diagonal();
-        for(int i=0; i<6; i++)
-        {
-          // A degenerate or CV-bridged window can leave ~zero (or non-finite)
-          // information here; 1/h would then put an unbounded-variance edge
-          // into the pose graph and GTSAM aborts with an indeterminate-system
-          // exception. Clamp to a weak but well-conditioned prior.
-          double h = fabs(bl->v6[i]);
-          double v = (std::isfinite(h) && h > 0) ? 1.0 / h : 1e-2;
-          bl->v6[i] = std::min(std::max(v, 1e-9), 1e-2);
-        }
+        for(int i=0; i<6; i++) bl->v6[i] = 1.0 / fabs(bl->v6[i]);
         mtx_loop.lock();
         buf_lba2loop.push_back(bl);
         mtx_loop.unlock();
@@ -2175,7 +2227,9 @@ public:
           x_buf.pop_back();
           pvec_buf.pop_back();
 
-          delete imu_pre_buf.front();
+          // The front factor may be nullptr for a LiDAR-only interval; delete
+          // nullptr is a no-op but keep it explicit.
+          if(imu_pre_buf.front()) delete imu_pre_buf.front();
           imu_pre_buf.pop_front();
         }
 
@@ -2582,21 +2636,10 @@ public:
         parameters.relinearizeThreshold = 0.01;
         parameters.relinearizeSkip = 1;
         gtsam::ISAM2 isam(parameters);
-        gtsam::Values results;
-        try
-        {
-          isam.update(graph, initial);
-          for(int i=0; i<5; i++) isam.update();
-          results = isam.calculateEstimate();
-        }
-        catch(const std::exception &e)
-        {
-          // An ill-posed graph (e.g. underconstrained variables after a long
-          // sensor dropout) must not kill the node. Skip this optimization;
-          // factors keep accumulating and the next loop event retries.
-          printf("PGO skipped (ill-posed linear system): %s\n", e.what());
-          continue;
-        }
+        isam.update(graph, initial);
+
+        for(int i=0; i<5; i++) isam.update();
+        gtsam::Values results = isam.calculateEstimate();
         int resultsize = results.size();
         
         IMUST x1 = scanPoses->at(buf_base-1)->x;

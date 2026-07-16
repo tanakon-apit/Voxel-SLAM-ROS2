@@ -526,6 +526,7 @@ public:
 
     for(int i=0; i<win_size-1; i++)
     {
+      if(imus_factor[i] == nullptr) continue;
       jtj.setZero(); gg.setZero();
       residual += imus_factor[i]->give_evaluate(x_stats[i], x_stats[i+1], jtj, gg, true);
       Hess.block<DIM*2, DIM*2>(i*DIM, i*DIM) += jtj;
@@ -576,7 +577,10 @@ public:
       mthreads[i] = new thread(&LidarFactor::evaluate_only_residual, &voxhess, x_stats, part*i, part*(i+1), ref(residuals[i]));
 
     for(int i=0; i<win_size-1; i++)
+    {
+      if(imus_factor[i] == nullptr) continue;
       residual1 += imus_factor[i]->give_evaluate(x_stats[i], x_stats[i+1], jtj, gg, false);
+    }
     residual1 *= (imu_coef * 0.5);
 
     for(int i=0; i<thd_num; i++)
@@ -620,8 +624,17 @@ public:
         residual1 = divide_thread(x_stats, voxhess, imus_factor, Hess, JacT);
         hesstime += get_time_sec() - tm;
         *hess = Hess;
+
+        // LiDAR-only (LO) poses carry no IMU factor, so their v/bg/ba diagonal
+        // is structurally zero; the LM term u*diag(Hess) cannot lift a zero, so
+        // the solve is singular and returns NaN updates that poison the voxel
+        // map (freeze). Add a small absolute prior on the velocity/bias DOFs of
+        // every pose. Applied to the solve copy only, not the exported *hess.
+        for(int j=0; j<win_size; j++)
+          for(int k=6; k<DIM; k++)
+            Hess(DIM*j+k, DIM*j+k) += 1e-6;
       }
-      
+
       Hess.topRows(DIM).setZero();
       Hess.leftCols(DIM).setZero();
       Hess.block<DIM, DIM>(0, 0).setIdentity();
@@ -640,7 +653,7 @@ public:
       }
 
       for(int j=0; j<win_size-1; j++)
-        imus_factor[j]->update_state(dxi.block<DIM, 1>(DIM*j, 0));
+        if(imus_factor[j]) imus_factor[j]->update_state(dxi.block<DIM, 1>(DIM*j, 0));
 
       double q1 = 0.5 * dxi.dot(u*D*dxi-JacT);
 
@@ -672,6 +685,7 @@ public:
 
         for(int j=0; j<win_size-1; j++)
         {
+          if(imus_factor[j] == nullptr) continue;
           imus_factor[j]->dbg = imus_factor[j]->dbg_buf;
           imus_factor[j]->dba = imus_factor[j]->dba_buf;
         }
@@ -734,6 +748,7 @@ public:
 
     for(int i=0; i<win_size-1; i++)
     {
+      if(imus_factor[i] == nullptr) continue;
       jtj.setZero(); gg.setZero();
       residual += imus_factor[i]->give_evaluate_g(x_stats[i], x_stats[i+1], jtj, gg, true);
       Hess.block<DIM*2, DIM*2>(i*DIM, i*DIM) += jtj.block<2*DIM, 2*DIM>(0, 0);
@@ -789,7 +804,10 @@ public:
       mthreads[i] = new thread(&LidarFactor::evaluate_only_residual, &voxhess, x_stats, part*i, part*(i+1), ref(residuals[i]));
 
     for(int i=0; i<win_size-1; i++)
+    {
+      if(imus_factor[i] == nullptr) continue;
       residual1 += imus_factor[i]->give_evaluate_g(x_stats[i], x_stats[i+1], jtj, gg, false);
+    }
     residual1 *= (imu_coef * 0.5);
 
     for(int i=0; i<thd_num; i++)
@@ -826,6 +844,13 @@ public:
       {
         residual1 = divide_thread(x_stats, voxhess, imus_factor, Hess, JacT);
         *hess = Hess;
+
+        // See LI_BA_Optimizer: LO poses have zero v/bg/ba diagonal (no IMU
+        // factor); regularize so the LM solve stays non-singular. gravity tail
+        // (last 3) is left to its own factor.
+        for(int j=0; j<win_size; j++)
+          for(int k=6; k<DIM; k++)
+            Hess(DIM*j+k, DIM*j+k) += 1e-6;
       }
 
       if(i == 0)
@@ -856,8 +881,8 @@ public:
       }
 
       for(int j=0; j<win_size-1; j++)
-        imus_factor[j]->update_state(dxi.block<DIM, 1>(DIM*j, 0));
-      
+        if(imus_factor[j]) imus_factor[j]->update_state(dxi.block<DIM, 1>(DIM*j, 0));
+
       double q1 = 0.5 * dxi.dot(u*D*dxi-JacT);
       residual2 = only_residual(x_stats_temp, voxhess, imus_factor);
       q = (residual1-residual2);
@@ -882,6 +907,7 @@ public:
 
         for(int j=0; j<win_size-1; j++)
         {
+          if(imus_factor[j] == nullptr) continue;
           imus_factor[j]->dbg = imus_factor[j]->dbg_buf;
           imus_factor[j]->dba = imus_factor[j]->dba_buf;
         }

@@ -5,10 +5,12 @@
 #include <deque>
 #include <sensor_msgs/msg/imu.hpp>
 
-// Process-noise inflation applied in motion_blur() to IMU pairs that involve a
-// constant-velocity pseudo-measurement ("cv_synth", see fill_imu_gaps in
-// voxelslam.hpp), so scan-to-map registration dominates across IMU dropouts.
-double g_imu_cv_cov_scale = 100.0;
+struct ImuStatePark
+{
+  Eigen::Vector3d bg, ba, g;
+  Eigen::Matrix3d cov_bg, cov_ba;   // marginal blocks cov(9:12,9:12), cov(12:15,12:15)
+  bool valid = false;
+};
 
 class IMUEKF
 {
@@ -35,6 +37,11 @@ public:
 
   int point_notime = 0;
 
+  Eigen::Vector3d cov_gyr_lo = Eigen::Vector3d::Ones();  // CV process noise on omega during LO
+  Eigen::Vector3d cov_acc_lo = Eigen::Vector3d::Ones();  // CV process noise on velocity during LO
+  Eigen::Vector3d last_frame_mean_gyr = Eigen::Vector3d::Zero();  // avg bias-corrected gyro of last IMU frame
+  ImuStatePark park;
+
   IMUEKF()
   {
     init_flag = false;
@@ -56,16 +63,12 @@ public:
     imu_poses.clear();
     // imu_poses.emplace_back(0, xc.R, xc.p, xc.v, angvel_last, acc_s_last);
 
-    // acc_imu/angvel_avr are read by the trailing extrapolation below even
-    // when the pair loop never runs (scan with <2 usable IMU samples, e.g. an
-    // unpadded dropout). Zero means constant velocity, not uninitialized NaN.
-    Eigen::Vector3d acc_imu = Eigen::Vector3d::Zero();
-    Eigen::Vector3d angvel_avr = Eigen::Vector3d::Zero();
-    Eigen::Vector3d acc_avr, vel_imu(xc.v), pos_imu(xc.p);
+    Eigen::Vector3d acc_imu, angvel_avr, acc_avr, vel_imu(xc.v), pos_imu(xc.p);
     Eigen::Matrix3d R_imu(xc.R);
     Eigen::Matrix<double, DIM, DIM> F_x, cov_w;
 
     double dt = 0;
+    Eigen::Vector3d gyr_sum = Eigen::Vector3d::Zero(); int gyr_cnt = 0;
     for(auto it_imu=imus.begin(); it_imu!=imus.end()-1; it_imu++)
     {
       sensor_msgs::msg::Imu &head = **(it_imu);
@@ -81,6 +84,7 @@ public:
                  0.5*(head.linear_acceleration.z + tail.linear_acceleration.z);
 
       angvel_avr -= xc.bg;
+      gyr_sum += angvel_avr; gyr_cnt++;
       acc_avr = acc_avr * scale_gravity - xc.ba;
       acc_imu = R_imu * acc_avr + xc.g;
 
@@ -107,12 +111,8 @@ public:
       F_x.block<3,3>(3,6)  = I33 * dt;
       F_x.block<3,3>(6,0)  = - R_imu * acc_avr_skew * dt;
       F_x.block<3,3>(6,12) = - R_imu * dt;
-      // A pair touching a cv_synth sample carries no real inertial
-      // information; widen its process noise so the LiDAR update dominates.
-      double cv_s = (head.header.frame_id == "cv_synth" ||
-                     tail.header.frame_id == "cv_synth") ? g_imu_cv_cov_scale : 1.0;
-      cov_w.block<3,3>(0,0).diagonal() = cov_gyr * cv_s * dt * dt;
-      cov_w.block<3,3>(6,6) = R_imu * cov_acc.asDiagonal() * R_imu.transpose() * cv_s * dt * dt;
+      cov_w.block<3,3>(0,0).diagonal() = cov_gyr * dt * dt;
+      cov_w.block<3,3>(6,6) = R_imu * cov_acc.asDiagonal() * R_imu.transpose() * dt * dt;
       cov_w.block<3,3>(9,9).diagonal()   = cov_bias_gyr * dt * dt;
       cov_w.block<3,3>(12,12).diagonal() = cov_bias_acc * dt * dt;
 
@@ -127,6 +127,8 @@ public:
       // double offt = max(toSec(head.header.stamp) - pcl_beg_time, 0.0);
       // imu_poses.emplace_back(offt, R_imu, pos_imu, vel_imu, angvel_avr, acc_imu);
     }
+
+    if(gyr_cnt > 0) last_frame_mean_gyr = gyr_sum / gyr_cnt;
 
     double imu_end_time = toSec(imus.back()->header.stamp);
     double note = pcl_end_time > imu_end_time ? 1.0 : -1.0;
@@ -176,6 +178,72 @@ public:
       }
     }
 
+  }
+
+  // LiDAR-only in-state predictor (used when IMU is absent; takes no imus).
+  // Mirrors the VoxelMap only_propag: constant omega stored in xc.bg, constant
+  // velocity in xc.v. Deskew reuses the exact motion_blur convention: curvature
+  // is seconds-from-begin (no /1000 scaling), points compensated to the end pose.
+  void cv_motion_blur(IMUST &xc, pcl::PointCloud<PointType> &pcl_in, double pcl_beg, double pcl_end)
+  {
+    double dt = pcl_end - last_pcl_end_time;
+    // predict (constant omega in bg, constant velocity in v)
+    xc.R = xc.R * Exp(xc.bg, dt);
+    xc.p = xc.p + xc.v * dt;
+    xc.t = pcl_end;
+    Eigen::Matrix<double, DIM, DIM> F_x, cov_w;
+    F_x.setIdentity(); cov_w.setZero();
+    F_x.block<3,3>(0,0) = Exp(xc.bg, -dt);
+    F_x.block<3,3>(0,9) = I33 * dt;
+    F_x.block<3,3>(3,6) = I33 * dt;
+    cov_w.block<3,3>(9,9).diagonal() = cov_gyr_lo * dt * dt;
+    cov_w.block<3,3>(6,6).diagonal() = cov_acc_lo * dt * dt;
+    xc.cov = F_x * xc.cov * F_x.transpose() + cov_w;
+    last_pcl_end_time = pcl_end;
+    if(point_notime) return;
+    double scan_dur = pcl_end - pcl_beg;
+    for(auto &pt: pcl_in.points) {
+      double off = pt.curvature - scan_dur; // <= 0, curvature = seconds-from-begin
+      Eigen::Matrix3d R_i = xc.R * Exp(xc.bg, off);
+      Eigen::Vector3d T_ei = xc.v * off;
+      Eigen::Vector3d P_i(pt.x, pt.y, pt.z);
+      Eigen::Vector3d P_c = Lid_rot_to_IMU.transpose() *
+        (xc.R.transpose() * (R_i * (Lid_rot_to_IMU * P_i + Lid_offset_to_IMU) + T_ei) - Lid_offset_to_IMU);
+      pt.x = P_c(0); pt.y = P_c(1); pt.z = P_c(2);
+    }
+  }
+
+  void park_and_enter_lo(IMUST &x, const Eigen::Vector3d &seed_omega)
+  {
+    park.bg = x.bg; park.ba = x.ba; park.g = x.g;
+    park.cov_bg = x.cov.block<3,3>(9,9);
+    park.cov_ba = x.cov.block<3,3>(12,12);
+    park.valid = true;
+    // repurpose bg as omega, seeded from the averaged pre-gap gyro
+    x.bg = seed_omega;
+    // omega prior: loose, zero cross-covariance to rows/cols 0:9
+    x.cov.block<3, DIM>(9,0).setZero();
+    x.cov.block<DIM, 3>(0,9).setZero();
+    x.cov.block<3,3>(9,9) = cov_gyr_lo.asDiagonal();
+    // freeze accel bias: tiny variance, zero cross terms (stop LO registration corrupting it)
+    x.cov.block<3, DIM>(12,0).setZero();
+    x.cov.block<DIM, 3>(0,12).setZero();
+    x.cov.block<3,3>(12,12) = 1e-8 * Eigen::Matrix3d::Identity();
+    // v and its covariance are left untouched (shared across modes)
+  }
+
+  void restore_and_exit_lo(IMUST &x)
+  {
+    if(!park.valid) return;
+    x.bg = park.bg; x.ba = park.ba; x.g = park.g;
+    // zero stale cross-covariance between bias block (9:15) and pose/vel (0:9)
+    x.cov.block<6, 9>(9,0).setZero();
+    x.cov.block<9, 6>(0,9).setZero();
+    x.cov.block<3,3>(9,9) = park.cov_bg;
+    x.cov.block<3,3>(12,12) = park.cov_ba;
+    // inflate velocity covariance so the first IMU scans re-tighten it
+    x.cov.block<3,3>(6,6) += 0.25 * Eigen::Matrix3d::Identity();
+    park.valid = false;
   }
 
   void IMU_init(deque<sensor_msgs::msg::Imu::SharedPtr> &imus)

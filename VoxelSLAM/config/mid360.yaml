@@ -32,6 +32,11 @@
       # the association gate rejects every point, so the EKF goes blind across
       # the map it just rebuilt. See voxel_map.hpp.
       fix_plane_init: false
+      enable_lo_fallback: true   # switch to LiDAR-only CV mode when IMU drops out
+      imu_gap_thresh: 0.05       # s of IMU silence past scan-end that declares a gap
+      lo_max_gap: 5.0            # s; gap longer than this falls through to reset
+      lo_cov_gyr: 1.0            # CV process noise on held turn-rate during LO [(rad/s)^2]
+      lo_cov_acc: 1.0            # CV process noise on velocity during LO [(m/s^2)^2]
     LocalBA:
       win_size: 10
       max_layer: 2

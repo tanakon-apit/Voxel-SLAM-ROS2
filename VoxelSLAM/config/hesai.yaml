@@ -27,17 +27,11 @@
       min_eigen_value: 0.0025
       degrade_bound: 100
       point_notime: 0
-      # Bridge IMU dropouts (holes > imu_gap_thresh s) with constant-velocity
-      # pseudo-measurements instead of dropping scans and corrupting the state.
-      imu_cv_fallback: true
-      # Must stay below the scan period (0.1 s), otherwise a hole spanning most
-      # of one scan is never padded.
-      imu_gap_thresh: 0.05
-      imu_cv_cov_scale: 1.0
-      # Hold the observed turn rate (from a scan-rate orientation EKF) through
-      # IMU dropouts instead of assuming zero rotation. Set false to A/B test
-      # against the pure constant-velocity model.
-      imu_cv_rate_observer: true
+      enable_lo_fallback: true   # switch to LiDAR-only CV mode when IMU drops out
+      imu_gap_thresh: 0.05       # s of IMU silence past scan-end that declares a gap
+      lo_max_gap: 5.0            # s; gap longer than this falls through to reset
+      lo_cov_gyr: 1.0            # CV process noise on held turn-rate during LO [(rad/s)^2]
+      lo_cov_acc: 1.0            # CV process noise on velocity during LO [(m/s^2)^2]
     LocalBA:
       win_size: 10
       max_layer: 2

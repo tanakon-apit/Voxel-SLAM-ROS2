@@ -6,6 +6,8 @@ This repository is a **ROS 2 (Humble)** port of the original ROS 1 [Voxel-SLAM](
 
 **Voxel-SLAM** is a complete, accurate, and versatile LiDAR-inertial SLAM system that fully utilizes short-term, mid-term, long-term, and multi-map data associations. It includes five modules: initialization, odometry, local mapping, loop closure, and global mapping. The initialization can provide accurate states and a local map in a static or dynamic initial state. The odometry estimates current states and detects potential system divergence. The local mapping refines the states and local map within the sliding window by a LiDAR-inertial BA. The loop closure can detect loops across multiple sessions. The global mapping refines the global map with an efficient hierarchical global BA.
 
+This ROS 2 port adds an optional **LiDAR-only (LO) fallback** that keeps odometry running through IMU dropouts by automatically switching from LiDAR-inertial (LIO) to a LiDAR-only constant-velocity mode for the duration of the gap and back again (§4.4). It is gated on a detected gap, so runs with continuous IMU are unchanged.
+
 <div align="center">
     <a href="https://youtu.be/Cg9W01aIUzE" target="_blank">
     <img src="./figure/systemoverview.png" width = 60% >
@@ -125,6 +127,7 @@ Each supported sensor has a launch file and a matching config YAML in `VoxelSLAM
 |---|---|---|
 | `vxlm_mid360.launch.py` | `mid360.yaml` | Livox Mid-360 |
 | `vxlm_mid360_bag.launch.py` | `mid360.yaml` | Livox Mid-360 (bag replay, see §4.2) |
+| `vxlm_mid360_bag_hybrid.launch.py` | `mid360_hybrid.yaml` | Mid-360 bag replay with emulated IMU dropouts (see §4.4) |
 | `vxlm_avia.launch.py` | `avia.yaml` | Livox Avia (handheld) |
 | `vxlm_avia_fly.launch.py` | `avia_fly.yaml` | Livox Avia (aerial, MARS dataset) |
 | `vxlm_hesai.launch.py` | `hesai.yaml` | Hesai (HILTI 2023, multi-session) |
@@ -190,6 +193,28 @@ General:
 
 Run each session in turn; sessions listed in `previous_map` are loaded from `save_path` and the loop closure can relocalize across them. After each session, run `ros2 param set /voxelslam finish true` for the final global BA before starting the next.
 
+### 4.4 IMU-dropout fallback (LIO ↔ LO)
+
+Upstream Voxel-SLAM requires continuous IMU — `sync_packages` waits for IMU to straddle every scan, and IMU starvation aborts the process. This port adds an optional **LiDAR-only (LO) fallback**: when the IMU stream drops out mid-run (e.g. the ~1.5 s Hesai dropouts), the front-end automatically falls back from LiDAR-inertial (LIO) to a LiDAR-only constant-velocity mode for the length of the gap, then resumes LIO when IMU returns — keeping a single continuous trajectory with no jump at either edge.
+
+How it works:
+
+- **Detection.** `sync_packages` releases a scan LiDAR-only once the IMU stalls behind the LiDAR by more than `imu_gap_thresh` (only after initialization — init still needs IMU).
+- **LO prediction.** During the gap the state is propagated with a constant angular-velocity / constant-velocity model — the same in-state method as [hku-mars/VoxelMap](https://github.com/hku-mars/voxelmap): the turn rate is held in the gyro-bias slot and the velocity in the velocity slot, both refined by scan-to-map registration. The turn rate is seeded from the average bias-corrected gyro of the last IMU frame.
+- **State handover.** The real gyro/accel biases and gravity are parked on entry and restored on exit, so IMU fusion resumes cleanly.
+- **Mixed-window BA.** Sliding-window intervals that span the gap contribute a pose-only LiDAR factor (no IMU pre-integration factor); IMU factors are added only on fully-IMU-covered intervals. A small prior keeps the velocity/bias DOFs of factor-less poses well-conditioned.
+- **Identical when IMU is healthy.** Everything above is gated on a detected gap, so a run with continuous IMU behaves exactly as stock (`enable_lo_fallback: false` also forces the stock path).
+
+See [VoxelSLAM/doc/hybrid_lio_lo.md](VoxelSLAM/doc/hybrid_lio_lo.md) for the mode state machine, the park/restore table, and the covariance treatment.
+
+**Testing it on a continuous-IMU bag.** `vxlm_mid360_bag_hybrid.launch.py` replays a bag but inserts an IMU-dropout relay (`scripts/imu_dropout.py`, `/imu/data` → `/imu/data_gap`) that punches periodic timed holes in the IMU, so the fallback is exercised even when the bag's own IMU is continuous:
+
+```bash
+ros2 launch voxel_slam vxlm_mid360_bag_hybrid.launch.py bag:=/path/to/bag_dir
+```
+
+On top of the §4.2 arguments: `gap_len` (default `1.5` — blackout length, s), `gap_period` (default `30.0` — seconds between blackouts), `gap_warmup` (default `30.0` — seconds of clean IMU before the first gap so the initializer succeeds), and `dropout:=false` for a clean A/B baseline through the same topic path (pure pass-through, no holes). The relay logs each `IMU BLACKOUT start` / `IMU restored`. It uses `config/mid360_hybrid.yaml`, identical to `mid360.yaml` but with `imu_topic: /imu/data_gap`.
+
 ## 5. Configuration
 
 Config files are ROS 2 parameter YAMLs under a `/**: ros__parameters:` root. The ROS 1 `A/B` parameter keys map to ROS 2's nested `A.B` (e.g. `General/lid_topic` → `General: lid_topic:`). All floating-point parameters must be written with decimals — ROS 2 is strict about int-vs-double types.
@@ -203,7 +228,12 @@ Key `General` parameters:
 - `odom_topic` — if set, publishes `nav_msgs/Odometry` on this topic (plus `/Odometry_Corrected`)
 - `save_path`, `previous_map`, `bagname`, `is_save_map` — multi-session map saving/loading (§4.3)
 
-`Odometry` extras added by this port: `imu_cv_fallback` bridges IMU dropouts with a constant-velocity motion model instead of silently dropping scans — see [VoxelSLAM/doc/imu_cv_fallback.md](VoxelSLAM/doc/imu_cv_fallback.md) for the design and state diagram.
+Key `Odometry` parameters for the LiDAR-only fallback (§4.4):
+
+- `enable_lo_fallback` (default `true`) — fall back to LiDAR-only mode on an IMU dropout; `false` reverts to the stock behaviour (wait for IMU)
+- `imu_gap_thresh` (default `0.05`) — seconds of IMU silence past a scan's end that declares a gap (guards against normal arrival latency)
+- `lo_max_gap` (default `5.0`) — a gap longer than this falls through to a reset
+- `lo_cov_gyr`, `lo_cov_acc` (default `1.0`) — constant-velocity process noise on the held turn-rate `[(rad/s)²]` and velocity `[(m/s²)²]` while in LO mode
 
 ## 6. Topics
 

@@ -73,4 +73,9 @@ install(TARGETS voxelslam
 install(DIRECTORY launch config rviz_cfg
   DESTINATION share/${PROJECT_NAME})
 
+# IMU dropout relay (emulate IMU loss on a continuous-IMU bag). Runnable as
+# `ros2 run voxel_slam imu_dropout.py` and used by vxlm_mid360_bag_hybrid.launch.py.
+install(PROGRAMS scripts/imu_dropout.py
+  DESTINATION lib/${PROJECT_NAME})
+
 ament_package()

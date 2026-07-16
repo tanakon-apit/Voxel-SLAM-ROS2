@@ -212,78 +212,12 @@ double imu_last_time = -1;
 int point_notime = 0;
 double last_pcl_time = -1;
 
-// Constant-velocity fallback for IMU dropouts (Odometry/imu_cv_fallback).
-// Holes > g_imu_gap_thresh in the stream are padded with synthetic samples
-// (frame_id "cv_synth") that encode zero rotation and zero world acceleration,
-// so EKF propagation, deskew and preintegration run unchanged through the gap.
-bool g_imu_cv_enable = false;
-double g_imu_gap_thresh = 0.05;    // [s] hole size that triggers padding; keep
-                                   // below the scan period or a hole spanning
-                                   // most of one scan is never padded
-double g_imu_period_est = 0.01;    // [s] nominal IMU period, EMA of live stream
-
-// Body-rate observer (Odometry/imu_cv_rate_observer): a 3-state EKF tracking
-// angular velocity from the registration-corrected orientation at scan rate,
-// z = Log(R_prev^T R_curr)/dt. It runs on every healthy scan whether or not
-// IMU data is present, but is consumed only by fill_imu_gaps(), which then
-// holds the current turn rate through a dropout instead of assuming zero
-// rotation. Its output is blended toward zero as its covariance grows, so a
-// stale or unobserved rate degrades back to the conservative zero-rate model.
-class RateObserver
-{
-public:
-  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-  Eigen::Vector3d w = Eigen::Vector3d::Zero(); // body angular velocity [rad/s]
-  Eigen::Matrix3d P = Eigen::Matrix3d::Identity(); // start uninformed
-  double q = 0.01;       // process noise [(rad/s)^2 / s], rate random walk
-  double r = 2e-3;       // measurement noise [(rad/s)^2] of Log(dR)/dt
-  double var_cap = 0.04; // [(rad/s)^2] variance at which output is half-trusted
-
-  Eigen::Matrix3d R_base;
-  double t_base = -1, t_pred = -1;
-
-  // healthy: registration succeeded and the odometry is not degenerate; an
-  // unhealthy scan drops the measurement base so a bad orientation never
-  // enters the finite difference. r_scale inflates measurement noise while
-  // the CV fallback is active (R is then correlated with our own prediction).
-  void step(const Eigen::Matrix3d &R, double t, bool healthy, double r_scale)
-  {
-    if(t_pred >= 0 && t > t_pred)
-      P += Eigen::Matrix3d::Identity() * q * (t - t_pred);
-    t_pred = t;
-
-    if(!healthy)
-    {
-      t_base = -1;
-      return;
-    }
-    if(t_base >= 0)
-    {
-      double dt = t - t_base;
-      if(dt > 1e-4 && dt < 1.0)
-      {
-        Eigen::Vector3d z = Log(R_base.transpose() * R) / dt;
-        Eigen::Matrix3d S = P + Eigen::Matrix3d::Identity() * (r * r_scale);
-        Eigen::Matrix3d K = P * S.inverse();
-        w += K * (z - w);
-        P = (Eigen::Matrix3d::Identity() - K) * P;
-      }
-    }
-    R_base = R;
-    t_base = t;
-  }
-
-  // Confidence-weighted rate for gap padding: full w when the covariance is
-  // small, smoothly fading to zero (the conservative model) as it grows.
-  Eigen::Vector3d gap_rate() const
-  {
-    double pm = P.trace() / 3.0;
-    return w * (var_cap / (var_cap + pm));
-  }
-};
-
-bool g_rate_obs_enable = false;
-RateObserver g_rate_obs;
+// Hybrid LIO/LO fallback controls (wired from the Odometry config namespace).
+// These live at namespace scope because sync_packages() and the IMU/PCL intake
+// buffers are namespace-scope, not members of VOXEL_SLAM.
+bool enable_lo_fallback = true;   // master switch for LiDAR-only fallback
+double imu_gap_thresh = 0.05;     // s of IMU silence past scan-end that declares a gap
+bool sys_init_done = false;       // set true once the front-end has finished one init
 
 void imu_handler(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
 {
@@ -304,77 +238,9 @@ void imu_handler(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
   //   msg->linear_acceleration.z = -9.7;
 
   mBuf.lock();
-  double tc = toSec(msg->header.stamp);
-  // Nominal-rate estimate for gap padding; holes themselves are excluded.
-  double dt = tc - imu_last_time;
-  if(imu_last_time > 0 && dt > 0 && dt < g_imu_gap_thresh)
-    g_imu_period_est += 0.05 * (dt - g_imu_period_est);
-  imu_last_time = tc;
+  imu_last_time = toSec(msg->header.stamp);
   imu_buf.push_back(msg);
   mBuf.unlock();
-}
-
-// Pad IMU dropouts inside the current scan span with constant-velocity
-// pseudo-measurements: raw gyro = bg (bias-corrected rate 0, attitude held),
-// raw accel = (ba - R^T g)/scale (bias-corrected specific force cancels
-// gravity, so v stays constant and p integrates linearly). Samples are tagged
-// "cv_synth" so motion_blur() can inflate their process noise. Returns the
-// number of samples inserted.
-int fill_imu_gaps(deque<sensor_msgs::msg::Imu::SharedPtr> &imus, IMUST &xc, IMUEKF &ekf)
-{
-  // Before EKF init there is no velocity/gravity estimate to hold constant.
-  if(!g_imu_cv_enable || !ekf.init_flag) return 0;
-
-  // Held body rate for the gap: zero (pure CV) unless the rate observer is
-  // enabled and confident. The synthetic gyro reads bias + w_gap, and the
-  // synthetic accel cancels gravity under the attitude R(t) that this rate
-  // implies, so bias/gravity correction downstream yields exactly a
-  // constant-rate, constant-velocity motion.
-  Eigen::Vector3d w_gap = Eigen::Vector3d::Zero();
-  if(g_rate_obs_enable)
-    w_gap = g_rate_obs.gap_rate();
-  const double t_state = ekf.last_pcl_end_time;
-
-  auto make_synth = [&](double t)
-  {
-    sensor_msgs::msg::Imu::SharedPtr s(new sensor_msgs::msg::Imu());
-    fromSec(s->header.stamp, t);
-    s->header.frame_id = "cv_synth";
-    Eigen::Matrix3d R_t = xc.R * Exp(w_gap, t - t_state);
-    Eigen::Vector3d raw_acc = (xc.ba - R_t.transpose() * xc.g) / ekf.scale_gravity;
-    s->angular_velocity.x = xc.bg[0] + w_gap[0];
-    s->angular_velocity.y = xc.bg[1] + w_gap[1];
-    s->angular_velocity.z = xc.bg[2] + w_gap[2];
-    s->linear_acceleration.x = raw_acc[0];
-    s->linear_acceleration.y = raw_acc[1];
-    s->linear_acceleration.z = raw_acc[2];
-    return s;
-  };
-
-  // Hole boundaries: previous scan end -> samples -> current scan end.
-  vector<double> ts;
-  ts.push_back(ekf.last_pcl_end_time);
-  for(auto &imu: imus) ts.push_back(toSec(imu->header.stamp));
-  ts.push_back(ekf.pcl_end_time);
-
-  int inserted = 0;
-  deque<sensor_msgs::msg::Imu::SharedPtr> filled;
-  size_t next_real = 0;
-  for(size_t i=0; i+1<ts.size(); i++)
-  {
-    if(i > 0 && next_real < imus.size())
-      filled.push_back(imus[next_real++]);
-    double hole = ts[i+1] - ts[i];
-    if(hole > g_imu_gap_thresh)
-      for(double t = ts[i] + g_imu_period_est; t < ts[i+1] - 0.5*g_imu_period_est; t += g_imu_period_est)
-      {
-        filled.push_back(make_synth(t));
-        inserted++;
-      }
-  }
-  if(inserted > 0)
-    imus.swap(filled);
-  return inserted;
 }
 
 template<class T>
@@ -406,9 +272,10 @@ void pcl_handler(T &msg)
   mBuf.unlock();
 }
 
-bool sync_packages(pcl::PointCloud<PointType>::Ptr &pl_ptr, deque<sensor_msgs::msg::Imu::SharedPtr> &imus, IMUEKF &p_imu)
+bool sync_packages(pcl::PointCloud<PointType>::Ptr &pl_ptr, deque<sensor_msgs::msg::Imu::SharedPtr> &imus, IMUEKF &p_imu, bool &lo_scan)
 {
   static bool pl_ready = false;
+  lo_scan = false;
 
   if(!pl_ready)
   {
@@ -438,32 +305,76 @@ bool sync_packages(pcl::PointCloud<PointType>::Ptr &pl_ptr, deque<sensor_msgs::m
     pl_ready = true;
   }
 
-  if(!pl_ready || imu_last_time <= p_imu.pcl_end_time) return false;
+  if(!pl_ready) return false;
 
-  mBuf.lock();
-  double imu_time = toSec(imu_buf.front()->header.stamp);
-  while((!imu_buf.empty()) && (imu_time < p_imu.pcl_end_time))
+  // Normal (IMU-covered) path: the IMU stream has advanced past this scan's end.
+  if(imu_last_time > p_imu.pcl_end_time)
   {
-    imu_time = toSec(imu_buf.front()->header.stamp);
-    if(imu_time > p_imu.pcl_end_time) break;
-    imus.push_back(imu_buf.front());
-    imu_buf.pop_front();
-  }
-  mBuf.unlock();
+    // Gather every IMU sample up to the scan end. Guard imu_buf.empty() BEFORE
+    // every front() -- dereferencing an empty deque is undefined behaviour and
+    // can hang the odometry thread.
+    mBuf.lock();
+    while((!imu_buf.empty()) && (toSec(imu_buf.front()->header.stamp) <= p_imu.pcl_end_time))
+    {
+      imus.push_back(imu_buf.front());
+      imu_buf.pop_front();
+    }
+    mBuf.unlock();
 
-  if(imu_buf.empty())
+    // Detect a hole straddled by the drained samples: when the IMU resumes
+    // after a dropout, this scan's samples are pre-gap leftovers + post-gap
+    // samples with a ~gap-sized jump between them. Integrating motion_blur
+    // across that jump blows the state up, so treat such a boundary scan as
+    // LiDAR-only (CV prediction) instead.
+    bool imu_hole = false;
+    for(size_t k = 1; k < imus.size(); k++)
+      if(toSec(imus[k]->header.stamp) - toSec(imus[k-1]->header.stamp) > imu_gap_thresh)
+      { imu_hole = true; break; }
+
+    if(imus.size() > 4 && !imu_hole)
+    {
+      lo_scan = false;
+      pl_ready = false;
+      return true;
+    }
+
+    // Under-covered or straddling a hole. If the LiDAR-only fallback is
+    // available, release this scan LO (discard the straddling samples so they
+    // never reach motion_blur); otherwise fall back to the original behaviour.
+    if(enable_lo_fallback && sys_init_done)
+    {
+      imus.clear();
+      lo_scan = true;
+      pl_ready = false;
+      return true;
+    }
+    if(!imus.empty())
+    {
+      lo_scan = false;
+      pl_ready = false;
+      return true;
+    }
+    return false;
+  }
+
+  // IMU has NOT reached this scan's end. Either just latency (wait) or a
+  // genuine IMU dropout. Fall back to LiDAR-only only once the system has
+  // initialized, the fallback is enabled, and the gap is real: newer LiDAR is
+  // already queued past the last IMU sample, or the buffered scans extend
+  // more than imu_gap_thresh past that last IMU sample. imus stays empty.
+  bool genuine_gap =
+      (!time_buf.empty() && time_buf.front() > imu_last_time) ||
+      (!time_buf.empty() && (time_buf.back() - imu_last_time > imu_gap_thresh));
+
+  if(enable_lo_fallback && sys_init_done && pl_ready && genuine_gap)
   {
-    printf("imu buf empty\n"); exit(0);
+    lo_scan = true;
+    pl_ready = false;
+    return true;
   }
 
-  pl_ready = false;
-
-  if(imus.size() > 4)
-    return true;
-  // Under-covered scan: normally dropped, but with the constant-velocity
-  // fallback active fill_imu_gaps() pads the hole downstream.
-  if(g_imu_cv_enable && p_imu.init_flag)
-    return true;
+  // No fallback (or not yet initialized, or gap below threshold => just
+  // latency): keep the original waiting behaviour. Never crash.
   return false;
 }
 
