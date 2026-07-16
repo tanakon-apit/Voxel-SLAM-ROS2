@@ -54,7 +54,8 @@ stateDiagram-v2
 
     CV : CONSTANT-VELOCITY FALLBACK
     CV : holes padded with cv_synth samples
-    CV : ω=0, a_world=0, noise ×imu_cv_cov_scale
+    CV : ω = ω̂ from rate observer (or 0), a_world = 0
+    CV : noise ×imu_cv_cov_scale
     CV : LiDAR registration dominates the update
 
     INIT --> IMU : EKF initialized (init_flag)
@@ -84,6 +85,39 @@ IMU gap at scan t=...: constant-velocity fallback ON (N synthetic samples)
 IMU stream recovered at t=...: back to IMU propagation
 ```
 
+## Rate observer (`imu_cv_rate_observer`)
+
+The pure CV model assumes **zero angular rate** during a gap — the EKF state
+`[R, p, v, bg, ba, g]` contains no ω to hold. The optional rate observer
+(`RateObserver`, voxelslam.hpp) removes that assumption:
+
+- A 3-state EKF over the body angular velocity `ω`, constant-rate process
+  model (`rate random walk q`), measured at scan rate from the
+  registration-corrected orientation: `z = Log(R_prevᵀ · R_curr)/Δt`.
+- It **runs on every scan** (with or without real IMU data), so at gap onset
+  it already holds a smoothed estimate of the recent turn rate — no cold start.
+- It is **consumed only by `fill_imu_gaps()`**: the synthetic gyro becomes
+  `bg + ω̂` and the synthetic accel cancels gravity under the rotating attitude
+  `R(t) = R₀·Exp(ω̂·t)`, so the padded motion is constant-rate + constant-velocity.
+- **Health gating**: scans where registration failed or the odometry is
+  degenerate drop the measurement base — a bad orientation never enters the
+  finite difference. While the fallback itself is padding, the measurement
+  noise is inflated 10× (R is then correlated with the observer's own
+  prediction through the deskew).
+- **Graceful decay**: the output is `ω̂ · var_cap/(var_cap + tr(P)/3)` — as the
+  covariance grows (no healthy measurements, e.g. LiDAR lost too), the held
+  rate fades smoothly back to zero, recovering the conservative CV model.
+
+```mermaid
+flowchart LR
+    subgraph every scan
+        REG[scan-to-map registration\ncorrected R] -->|healthy only| OBS[rate observer EKF\nz = Log dR / dt]
+    end
+    OBS -->|"ω̂ · confidence(P)"| GAP[fill_imu_gaps\nsynthetic gyro = bg + ω̂]
+    GAP --> DESKEW[propagation + deskew\nwith held turn rate]
+    DESKEW --> REG
+```
+
 ## Parameters (`Odometry` section)
 
 | parameter | default | meaning |
@@ -91,6 +125,10 @@ IMU stream recovered at t=...: back to IMU propagation
 | `imu_cv_fallback` | `false` | enable the fallback (stock behaviour when off) |
 | `imu_gap_thresh` | `0.05` s | hole size that triggers padding; also the upper bound for the nominal-period estimator. **Must stay below the scan period** (0.1 s at 10 Hz) — at or above it, a hole spanning most of one scan is never padded and the scan propagates with almost no samples |
 | `imu_cv_cov_scale` | `100.0` | process-noise inflation for synthetic pairs |
+| `imu_cv_rate_observer` | `false` | hold the observed turn rate through gaps instead of zero rotation |
+| `rate_obs_q` | `0.01` | observer process noise [(rad/s)²/s]; higher tracks faster turns, lower smooths more |
+| `rate_obs_r` | `0.002` | observer measurement noise [(rad/s)²] of `Log(dR)/Δt` |
+| `rate_obs_var_cap` | `0.04` | variance [(rad/s)²] at which the held rate is half-trusted (decay toward zero) |
 
 The nominal IMU period is estimated online (EMA over live inter-sample gaps
 smaller than `imu_gap_thresh`), so no rate parameter is needed.
@@ -101,7 +139,9 @@ smaller than `imu_gap_thresh`), so no rate parameter is needed.
   deskew and the prior are wrong; the inflated noise lets registration correct
   the pose, but a long gap in feature-poor surroundings can still degenerate —
   in that case the stock divergence reset (new session + relocalization) takes
-  over, which is the intended safety net.
+  over, which is the intended safety net. The rate observer mitigates the
+  steady-turn case (rate held, not zeroed) but cannot see rate *changes* that
+  happen inside a gap with no scans.
 - Gyro/accel biases are held constant through the gap (they are unobservable
   without real IMU data).
 - The BA preintegration factors treat synthetic samples with nominal IMU noise

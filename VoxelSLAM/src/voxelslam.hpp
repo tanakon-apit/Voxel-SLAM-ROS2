@@ -222,6 +222,69 @@ double g_imu_gap_thresh = 0.05;    // [s] hole size that triggers padding; keep
                                    // most of one scan is never padded
 double g_imu_period_est = 0.01;    // [s] nominal IMU period, EMA of live stream
 
+// Body-rate observer (Odometry/imu_cv_rate_observer): a 3-state EKF tracking
+// angular velocity from the registration-corrected orientation at scan rate,
+// z = Log(R_prev^T R_curr)/dt. It runs on every healthy scan whether or not
+// IMU data is present, but is consumed only by fill_imu_gaps(), which then
+// holds the current turn rate through a dropout instead of assuming zero
+// rotation. Its output is blended toward zero as its covariance grows, so a
+// stale or unobserved rate degrades back to the conservative zero-rate model.
+class RateObserver
+{
+public:
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+  Eigen::Vector3d w = Eigen::Vector3d::Zero(); // body angular velocity [rad/s]
+  Eigen::Matrix3d P = Eigen::Matrix3d::Identity(); // start uninformed
+  double q = 0.01;       // process noise [(rad/s)^2 / s], rate random walk
+  double r = 2e-3;       // measurement noise [(rad/s)^2] of Log(dR)/dt
+  double var_cap = 0.04; // [(rad/s)^2] variance at which output is half-trusted
+
+  Eigen::Matrix3d R_base;
+  double t_base = -1, t_pred = -1;
+
+  // healthy: registration succeeded and the odometry is not degenerate; an
+  // unhealthy scan drops the measurement base so a bad orientation never
+  // enters the finite difference. r_scale inflates measurement noise while
+  // the CV fallback is active (R is then correlated with our own prediction).
+  void step(const Eigen::Matrix3d &R, double t, bool healthy, double r_scale)
+  {
+    if(t_pred >= 0 && t > t_pred)
+      P += Eigen::Matrix3d::Identity() * q * (t - t_pred);
+    t_pred = t;
+
+    if(!healthy)
+    {
+      t_base = -1;
+      return;
+    }
+    if(t_base >= 0)
+    {
+      double dt = t - t_base;
+      if(dt > 1e-4 && dt < 1.0)
+      {
+        Eigen::Vector3d z = Log(R_base.transpose() * R) / dt;
+        Eigen::Matrix3d S = P + Eigen::Matrix3d::Identity() * (r * r_scale);
+        Eigen::Matrix3d K = P * S.inverse();
+        w += K * (z - w);
+        P = (Eigen::Matrix3d::Identity() - K) * P;
+      }
+    }
+    R_base = R;
+    t_base = t;
+  }
+
+  // Confidence-weighted rate for gap padding: full w when the covariance is
+  // small, smoothly fading to zero (the conservative model) as it grows.
+  Eigen::Vector3d gap_rate() const
+  {
+    double pm = P.trace() / 3.0;
+    return w * (var_cap / (var_cap + pm));
+  }
+};
+
+bool g_rate_obs_enable = false;
+RateObserver g_rate_obs;
+
 void imu_handler(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
 {
   static int flag = 1;
@@ -262,15 +325,26 @@ int fill_imu_gaps(deque<sensor_msgs::msg::Imu::SharedPtr> &imus, IMUST &xc, IMUE
   // Before EKF init there is no velocity/gravity estimate to hold constant.
   if(!g_imu_cv_enable || !ekf.init_flag) return 0;
 
-  Eigen::Vector3d raw_acc = (xc.ba - xc.R.transpose() * xc.g) / ekf.scale_gravity;
+  // Held body rate for the gap: zero (pure CV) unless the rate observer is
+  // enabled and confident. The synthetic gyro reads bias + w_gap, and the
+  // synthetic accel cancels gravity under the attitude R(t) that this rate
+  // implies, so bias/gravity correction downstream yields exactly a
+  // constant-rate, constant-velocity motion.
+  Eigen::Vector3d w_gap = Eigen::Vector3d::Zero();
+  if(g_rate_obs_enable)
+    w_gap = g_rate_obs.gap_rate();
+  const double t_state = ekf.last_pcl_end_time;
+
   auto make_synth = [&](double t)
   {
     sensor_msgs::msg::Imu::SharedPtr s(new sensor_msgs::msg::Imu());
     fromSec(s->header.stamp, t);
     s->header.frame_id = "cv_synth";
-    s->angular_velocity.x = xc.bg[0];
-    s->angular_velocity.y = xc.bg[1];
-    s->angular_velocity.z = xc.bg[2];
+    Eigen::Matrix3d R_t = xc.R * Exp(w_gap, t - t_state);
+    Eigen::Vector3d raw_acc = (xc.ba - R_t.transpose() * xc.g) / ekf.scale_gravity;
+    s->angular_velocity.x = xc.bg[0] + w_gap[0];
+    s->angular_velocity.y = xc.bg[1] + w_gap[1];
+    s->angular_velocity.z = xc.bg[2] + w_gap[2];
     s->linear_acceleration.x = raw_acc[0];
     s->linear_acceleration.y = raw_acc[1];
     s->linear_acceleration.z = raw_acc[2];

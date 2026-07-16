@@ -1071,6 +1071,11 @@ public:
     get_param<bool>(n, "Odometry/imu_cv_fallback", g_imu_cv_enable, false);
     get_param<double>(n, "Odometry/imu_gap_thresh", g_imu_gap_thresh, 0.05);
     get_param<double>(n, "Odometry/imu_cv_cov_scale", g_imu_cv_cov_scale, 100.0);
+    // Rate observer feeding the fallback's held turn rate (doc/imu_cv_fallback.md).
+    get_param<bool>(n, "Odometry/imu_cv_rate_observer", g_rate_obs_enable, false);
+    get_param<double>(n, "Odometry/rate_obs_q", g_rate_obs.q, 0.01);
+    get_param<double>(n, "Odometry/rate_obs_r", g_rate_obs.r, 0.002);
+    get_param<double>(n, "Odometry/rate_obs_var_cap", g_rate_obs.var_cap, 0.04);
     // Let plane_update() initialize a plane that has none (see voxel_map.hpp).
     // CHANGES SLAM OUTPUT. Off = stock behaviour.
     get_param<bool>(n, "Odometry/fix_plane_init", fix_plane_init, false);
@@ -2005,12 +2010,21 @@ public:
         PVecPtr pptr(new PVec);
         var_init(extrin_para, pl_down, pptr, dept_err, beam_err);
 
-        if(lio_state_estimation(pptr))
+        bool lio_ok = lio_state_estimation(pptr);
+        if(lio_ok)
         {
           if(degrade_cnt > 0) degrade_cnt--;
         }
         else
           degrade_cnt++;
+
+        // Track the body rate from the corrected orientation (runs with or
+        // without real IMU data; consumed only by fill_imu_gaps). While the
+        // fallback is padding, R is correlated with our own prediction, so
+        // the measurement gets 10x noise.
+        if(g_rate_obs_enable)
+          g_rate_obs.step(x_curr.R, x_curr.t, lio_ok && degrade_cnt == 0,
+                          n_synth > 0 ? 10.0 : 1.0);
 
         // Pose-health flag: degenerate while scan matching fails and during
         // the post-reset grace window. Consumers match by scan stamp.
@@ -2102,7 +2116,16 @@ public:
 
         ScanPose *bl = new ScanPose(x_buf[0], pvec_buf[0]);
         bl->v6 = hess.block<6, 6>(0, DIM).diagonal();
-        for(int i=0; i<6; i++) bl->v6[i] = 1.0 / fabs(bl->v6[i]);
+        for(int i=0; i<6; i++)
+        {
+          // A degenerate or CV-bridged window can leave ~zero (or non-finite)
+          // information here; 1/h would then put an unbounded-variance edge
+          // into the pose graph and GTSAM aborts with an indeterminate-system
+          // exception. Clamp to a weak but well-conditioned prior.
+          double h = fabs(bl->v6[i]);
+          double v = (std::isfinite(h) && h > 0) ? 1.0 / h : 1e-2;
+          bl->v6[i] = std::min(std::max(v, 1e-9), 1e-2);
+        }
         mtx_loop.lock();
         buf_lba2loop.push_back(bl);
         mtx_loop.unlock();
@@ -2559,10 +2582,21 @@ public:
         parameters.relinearizeThreshold = 0.01;
         parameters.relinearizeSkip = 1;
         gtsam::ISAM2 isam(parameters);
-        isam.update(graph, initial);
-
-        for(int i=0; i<5; i++) isam.update();
-        gtsam::Values results = isam.calculateEstimate();
+        gtsam::Values results;
+        try
+        {
+          isam.update(graph, initial);
+          for(int i=0; i<5; i++) isam.update();
+          results = isam.calculateEstimate();
+        }
+        catch(const std::exception &e)
+        {
+          // An ill-posed graph (e.g. underconstrained variables after a long
+          // sensor dropout) must not kill the node. Skip this optimization;
+          // factors keep accumulating and the next loop event retries.
+          printf("PGO skipped (ill-posed linear system): %s\n", e.what());
+          continue;
+        }
         int resultsize = results.size();
         
         IMUST x1 = scanPoses->at(buf_base-1)->x;

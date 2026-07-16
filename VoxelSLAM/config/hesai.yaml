@@ -34,6 +34,10 @@
       # of one scan is never padded.
       imu_gap_thresh: 0.05
       imu_cv_cov_scale: 1.0
+      # Hold the observed turn rate (from a scan-rate orientation EKF) through
+      # IMU dropouts instead of assuming zero rotation. Set false to A/B test
+      # against the pure constant-velocity model.
+      imu_cv_rate_observer: true
     LocalBA:
       win_size: 10
       max_layer: 2
