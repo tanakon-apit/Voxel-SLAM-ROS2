@@ -212,6 +212,14 @@ double imu_last_time = -1;
 int point_notime = 0;
 double last_pcl_time = -1;
 
+// Constant-velocity fallback for IMU dropouts (Odometry/imu_cv_fallback).
+// Holes > g_imu_gap_thresh in the stream are padded with synthetic samples
+// (frame_id "cv_synth") that encode zero rotation and zero world acceleration,
+// so EKF propagation, deskew and preintegration run unchanged through the gap.
+bool g_imu_cv_enable = false;
+double g_imu_gap_thresh = 0.1;     // [s] hole size that triggers padding
+double g_imu_period_est = 0.01;    // [s] nominal IMU period, EMA of live stream
+
 void imu_handler(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
 {
   static int flag = 1;
@@ -231,9 +239,66 @@ void imu_handler(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
   //   msg->linear_acceleration.z = -9.7;
 
   mBuf.lock();
-  imu_last_time = toSec(msg->header.stamp);
+  double tc = toSec(msg->header.stamp);
+  // Nominal-rate estimate for gap padding; holes themselves are excluded.
+  double dt = tc - imu_last_time;
+  if(imu_last_time > 0 && dt > 0 && dt < g_imu_gap_thresh)
+    g_imu_period_est += 0.05 * (dt - g_imu_period_est);
+  imu_last_time = tc;
   imu_buf.push_back(msg);
   mBuf.unlock();
+}
+
+// Pad IMU dropouts inside the current scan span with constant-velocity
+// pseudo-measurements: raw gyro = bg (bias-corrected rate 0, attitude held),
+// raw accel = (ba - R^T g)/scale (bias-corrected specific force cancels
+// gravity, so v stays constant and p integrates linearly). Samples are tagged
+// "cv_synth" so motion_blur() can inflate their process noise. Returns the
+// number of samples inserted.
+int fill_imu_gaps(deque<sensor_msgs::msg::Imu::SharedPtr> &imus, IMUST &xc, IMUEKF &ekf)
+{
+  // Before EKF init there is no velocity/gravity estimate to hold constant.
+  if(!g_imu_cv_enable || !ekf.init_flag) return 0;
+
+  Eigen::Vector3d raw_acc = (xc.ba - xc.R.transpose() * xc.g) / ekf.scale_gravity;
+  auto make_synth = [&](double t)
+  {
+    sensor_msgs::msg::Imu::SharedPtr s(new sensor_msgs::msg::Imu());
+    fromSec(s->header.stamp, t);
+    s->header.frame_id = "cv_synth";
+    s->angular_velocity.x = xc.bg[0];
+    s->angular_velocity.y = xc.bg[1];
+    s->angular_velocity.z = xc.bg[2];
+    s->linear_acceleration.x = raw_acc[0];
+    s->linear_acceleration.y = raw_acc[1];
+    s->linear_acceleration.z = raw_acc[2];
+    return s;
+  };
+
+  // Hole boundaries: previous scan end -> samples -> current scan end.
+  vector<double> ts;
+  ts.push_back(ekf.last_pcl_end_time);
+  for(auto &imu: imus) ts.push_back(toSec(imu->header.stamp));
+  ts.push_back(ekf.pcl_end_time);
+
+  int inserted = 0;
+  deque<sensor_msgs::msg::Imu::SharedPtr> filled;
+  size_t next_real = 0;
+  for(size_t i=0; i+1<ts.size(); i++)
+  {
+    if(i > 0 && next_real < imus.size())
+      filled.push_back(imus[next_real++]);
+    double hole = ts[i+1] - ts[i];
+    if(hole > g_imu_gap_thresh)
+      for(double t = ts[i] + g_imu_period_est; t < ts[i+1] - 0.5*g_imu_period_est; t += g_imu_period_est)
+      {
+        filled.push_back(make_synth(t));
+        inserted++;
+      }
+  }
+  if(inserted > 0)
+    imus.swap(filled);
+  return inserted;
 }
 
 template<class T>
@@ -319,8 +384,11 @@ bool sync_packages(pcl::PointCloud<PointType>::Ptr &pl_ptr, deque<sensor_msgs::m
 
   if(imus.size() > 4)
     return true;
-  else
-    return false;
+  // Under-covered scan: normally dropped, but with the constant-velocity
+  // fallback active fill_imu_gaps() pads the hole downstream.
+  if(g_imu_cv_enable && p_imu.init_flag)
+    return true;
+  return false;
 }
 
 double dept_err, beam_err;

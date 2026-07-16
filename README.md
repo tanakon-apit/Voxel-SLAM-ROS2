@@ -203,6 +203,8 @@ Key `General` parameters:
 - `odom_topic` — if set, publishes `nav_msgs/Odometry` on this topic (plus `/Odometry_Corrected`)
 - `save_path`, `previous_map`, `bagname`, `is_save_map` — multi-session map saving/loading (§4.3)
 
+`Odometry` extras added by this port: `imu_cv_fallback` bridges IMU dropouts with a constant-velocity motion model instead of silently dropping scans — see [VoxelSLAM/doc/imu_cv_fallback.md](VoxelSLAM/doc/imu_cv_fallback.md) for the design and state diagram.
+
 ## 6. Topics
 
 **Subscribed**

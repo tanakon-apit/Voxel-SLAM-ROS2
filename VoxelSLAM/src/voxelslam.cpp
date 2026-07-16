@@ -1067,6 +1067,10 @@ public:
     get_param<double>(n, "Odometry/voxel_size", voxel_size, 1);
     get_param<double>(n, "Odometry/min_eigen_value", min_eigen_value, 0.0025);
     get_param<int>(n, "Odometry/degrade_bound", degrade_bound, 10);
+    // Constant-velocity fallback across IMU dropouts (see fill_imu_gaps).
+    get_param<bool>(n, "Odometry/imu_cv_fallback", g_imu_cv_enable, false);
+    get_param<double>(n, "Odometry/imu_gap_thresh", g_imu_gap_thresh, 0.1);
+    get_param<double>(n, "Odometry/imu_cv_cov_scale", g_imu_cv_cov_scale, 100.0);
     // Let plane_update() initialize a plane that has none (see voxel_map.hpp).
     // CHANGES SLAM OUTPUT. Off = stock behaviour.
     get_param<bool>(n, "Odometry/fix_plane_init", fix_plane_init, false);
@@ -1954,6 +1958,21 @@ public:
       }
       else
       {
+        int n_synth = fill_imu_gaps(imus, x_curr, odom_ekf);
+        static bool cv_active = false;
+        if(n_synth > 0 && !cv_active)
+        {
+          cv_active = true;
+          printf("IMU gap at scan t=%.3lf: constant-velocity fallback ON (%d synthetic samples)\n",
+                 odom_ekf.pcl_end_time, n_synth);
+        }
+        else if(n_synth == 0 && cv_active)
+        {
+          cv_active = false;
+          printf("IMU stream recovered at t=%.3lf: back to IMU propagation\n",
+                 odom_ekf.pcl_end_time);
+        }
+
         if(odom_ekf.process(x_curr, *pcl_curr, imus) == 0)
           continue;
 

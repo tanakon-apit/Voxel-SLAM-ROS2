@@ -5,6 +5,11 @@
 #include <deque>
 #include <sensor_msgs/msg/imu.hpp>
 
+// Process-noise inflation applied in motion_blur() to IMU pairs that involve a
+// constant-velocity pseudo-measurement ("cv_synth", see fill_imu_gaps in
+// voxelslam.hpp), so scan-to-map registration dominates across IMU dropouts.
+double g_imu_cv_cov_scale = 100.0;
+
 class IMUEKF
 {
 public:
@@ -97,8 +102,12 @@ public:
       F_x.block<3,3>(3,6)  = I33 * dt;
       F_x.block<3,3>(6,0)  = - R_imu * acc_avr_skew * dt;
       F_x.block<3,3>(6,12) = - R_imu * dt;
-      cov_w.block<3,3>(0,0).diagonal() = cov_gyr * dt * dt;
-      cov_w.block<3,3>(6,6) = R_imu * cov_acc.asDiagonal() * R_imu.transpose() * dt * dt;
+      // A pair touching a cv_synth sample carries no real inertial
+      // information; widen its process noise so the LiDAR update dominates.
+      double cv_s = (head.header.frame_id == "cv_synth" ||
+                     tail.header.frame_id == "cv_synth") ? g_imu_cv_cov_scale : 1.0;
+      cov_w.block<3,3>(0,0).diagonal() = cov_gyr * cv_s * dt * dt;
+      cov_w.block<3,3>(6,6) = R_imu * cov_acc.asDiagonal() * R_imu.transpose() * cv_s * dt * dt;
       cov_w.block<3,3>(9,9).diagonal()   = cov_bias_gyr * dt * dt;
       cov_w.block<3,3>(12,12).diagonal() = cov_bias_acc * dt * dt;
 

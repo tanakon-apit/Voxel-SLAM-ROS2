@@ -27,6 +27,11 @@
       min_eigen_value: 0.0025
       degrade_bound: 100
       point_notime: 0
+      # Bridge IMU dropouts (holes > imu_gap_thresh s) with constant-velocity
+      # pseudo-measurements instead of dropping scans and corrupting the state.
+      imu_cv_fallback: true
+      imu_gap_thresh: 0.1
+      imu_cv_cov_scale: 1.0
     LocalBA:
       win_size: 10
       max_layer: 2
